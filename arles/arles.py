@@ -522,20 +522,73 @@ class ArchetypeLearner:
 
         return ss_1d, amp_1d, coord_1d
 
-    def _compute_confidence_scores(self, n_users: int) -> np.ndarray:
-        """Compute confidence scores (vectorized)."""
-        action_scores = np.minimum(
+    def _compute_confidence_scores(
+        self,
+        n_users: int,
+        reference_time: Optional[float] = None,
+        window_days: Optional[float] = None,
+    ) -> np.ndarray:
+        """How much to trust a user's archetype vector, in [0,1].
+
+        Three components, weighted 50/30/20 as in the paper:
+          volume   -- log-scaled action count, saturating at 2 * min_actions
+          recency  -- how close to the end of the window the user was last active
+          lifespan -- how much of the window the user's activity spans
+
+        Both time terms are measured against the *observed window*, never against the
+        wall clock, and are normalised by the window's own duration.
+
+        Two bugs are fixed here, and they interact:
+
+        1. `datetime.now()` was used as the reference for recency. With timestamps
+           correctly parsed (they previously all *were* now(), which masked this), a
+           2024 window scored recency ~= exp(-644/30) ~= 5e-10 for every user, so
+           confidence could not exceed ~0.53 and the >= 0.5 gate rejected everyone.
+           Worse, the result depended on the date the script was run.
+
+        2. Both time terms were normalised by a hard-coded 30 days while the analysis
+           window is 5 days. Recency was therefore confined to [exp(-5/30), 1] = [0.85, 1]
+           and lifespan to [0, 0.167]: both near-constant across users, which silently
+           reduced confidence to the volume term alone and made the 30% and 20% weights
+           decorative. Normalising by the window duration restores their range to [0,1]
+           and makes the weights mean what they say.
+
+        Args:
+            reference_time: end of the window, as a POSIX timestamp. Defaults to the
+                latest action observed.
+            window_days: duration of the window in days. Defaults to the span of the
+                observed data.
+        """
+        if n_users == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        last_seen = self.last_seen[:n_users]
+        first_seen = self.first_seen[:n_users]
+
+        if reference_time is None:
+            reference_time = float(last_seen.max())
+
+        if window_days is None:
+            seen = first_seen[first_seen > 0]
+            earliest = float(seen.min()) if seen.size else reference_time
+            window_days = (reference_time - earliest) / 86400
+        # A window of zero duration (single instant) leaves the time terms undefined;
+        # fall back to a nominal day so they stay finite rather than dividing by zero.
+        window_days = max(float(window_days), 1e-9)
+
+        volume_scores = np.minimum(
             1.0, np.log1p(self.action_count[:n_users]) / np.log1p(self.min_actions * 2)
         )
 
-        current_time = datetime.now().timestamp()
-        days_since_last = (current_time - self.last_seen[:n_users]) / 86400
-        recency_scores = np.exp(-days_since_last / 30)
+        days_since_last = np.maximum(0.0, (reference_time - last_seen) / 86400)
+        # Decay over a third of the window: a user last seen a full window ago scores
+        # exp(-3) ~= 0.05 rather than an indistinguishable ~0.85.
+        recency_scores = np.exp(-days_since_last / (window_days / 3.0))
 
-        span_days = (self.last_seen[:n_users] - self.first_seen[:n_users]) / 86400
-        span_scores = np.minimum(1.0, span_days / 30)
+        span_days = (last_seen - first_seen) / 86400
+        lifespan_scores = np.minimum(1.0, np.maximum(0.0, span_days) / window_days)
 
-        confidence = 0.5 * action_scores + 0.3 * recency_scores + 0.2 * span_scores
+        confidence = 0.5 * volume_scores + 0.3 * recency_scores + 0.2 * lifespan_scores
         return np.clip(confidence, 0.0, 1.0).astype(np.float32)
 
     def get_archetypes(self) -> Dict[str, Tuple[np.ndarray, float]]:

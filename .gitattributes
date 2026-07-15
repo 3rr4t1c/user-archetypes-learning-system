@@ -1,0 +1,12 @@
+# Normalise line endings. The working tree had CRLF while HEAD had LF, which made
+# every untouched file show up as fully rewritten in git diff. Without this, a
+# reviewer cloning the repo sees thousands of phantom changes.
+* text=auto eol=lf
+
+# Data and figures are binary as far as diffing is concerned.
+*.csv -text
+*.pdf binary
+*.png binary
+*.jpg binary
+*.pptx binary
+*.ipynb -text

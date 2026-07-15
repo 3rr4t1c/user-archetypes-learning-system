@@ -6,10 +6,11 @@ Learns three archetypes: Superspreaders, Amplifiers, and Coordinated actors.
 """
 
 import csv
+import re
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -27,6 +28,102 @@ from .metrics import (
 warnings.filterwarnings("ignore")
 
 
+class MalformedActionError(ValueError):
+    """Raised when an action row cannot be parsed.
+
+    Never swallow this silently: a row that cannot be parsed must be counted and
+    reported, not replaced by a plausible-looking default. See parse_timestamp.
+    """
+
+
+_TIMESTAMP_RE = re.compile(
+    r"^(?P<head>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<frac>\d+))?"
+    r"(?:\s*(?P<tz>Z|z|[+-]\d{2}:?\d{2}))?$"
+)
+
+_PLC_URI_RE = re.compile(r"^at://did:plc:([^/]+)/")
+
+
+def author_of_uri(uri: Optional[str]) -> Optional[str]:
+    """Return the author DID of an AT-URI, or None if it is not a did:plc URI.
+
+    An AT-Protocol record lives in its author's repository, so the DID embedded in the
+    URI *is* the author:
+
+        at://did:plc:vlpy6zuqqum5tumv7b6dw5fp/app.bsky.feed.post/3l2dszqkmqt25
+                     ^^^^^^^^^^^^^^^^^^^^^^^^ the author
+
+    This matters because the dataset is a sample: the post being reshared is present in
+    the file for only 0.09% of reposts (470 of 509,844 in bluesky_sampled_clean_small.csv),
+    so resolving a reshare's author by looking the original post up in the stream fails
+    almost always. Parsing the URI resolves 100% of them without needing the original.
+
+    The returned id has no "did:plc:" prefix, matching the author_user_id column exactly
+    (verified on 400k rows: for post/repost/reply/quote the parsed DID equals
+    author_user_id 100% of the time).
+
+    did:web identities (e.g. at://did:web:genco.me/...) are rare and return None.
+    """
+    if not uri:
+        return None
+    m = _PLC_URI_RE.match(uri)
+    return m.group(1) if m else None
+
+
+def parse_timestamp(value: Any) -> datetime:
+    """Parse an action timestamp into a timezone-aware UTC datetime.
+
+    The dataset stores ISO-8601 with an explicit UTC offset, in three variants that
+    all occur in practice:
+
+        2024-08-23 00:00:00+00:00              (no fractional part)
+        2024-08-23 00:03:48.226000+00:00       (microseconds, the common case)
+        2024-10-03 01:00:07.649171700+00:00    (nanoseconds, written by pandas)
+
+    datetime.fromisoformat handles only the first two before Python 3.11, so the
+    fractional part is normalised to 6 digits before parsing.
+
+    Why this is strict: the previous implementation tried "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S" and "%Y-%m-%d" with strptime and fell back to
+    datetime.now() when all three failed. Every one of them rejects the "+00:00"
+    offset, so *every* row took the fallback and the whole action stream was
+    replaced by the wall-clock time of the run. A multi-day window collapsed into
+    the seconds it took to read the file, which zeroed the TASH-index outright and
+    corrupted every other time-dependent metric. A timestamp that cannot be parsed
+    is now an error, never a guess.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        m = _TIMESTAMP_RE.match(value.strip())
+        if m is None:
+            raise MalformedActionError(f"unparseable timestamp: {value!r}")
+
+        head = m.group("head")
+        frac = m.group("frac") or ""
+        tz = m.group("tz") or "+00:00"
+
+        # Truncate (or pad) the fractional part to microsecond resolution.
+        micros = (frac + "000000")[:6]
+        if tz in ("Z", "z"):
+            tz = "+00:00"
+        elif ":" not in tz:  # "+0000" -> "+00:00"
+            tz = tz[:3] + ":" + tz[3:]
+
+        try:
+            dt = datetime.fromisoformat(f"{head}.{micros}{tz}")
+        except ValueError as exc:  # pragma: no cover - regex should prevent this
+            raise MalformedActionError(f"unparseable timestamp: {value!r}") from exc
+    else:
+        raise MalformedActionError(f"unparseable timestamp: {value!r}")
+
+    # Normalise to UTC so that .timestamp() is comparable across rows.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 @dataclass
 class Action:
     """Represents a single social media action."""
@@ -41,18 +138,13 @@ class Action:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Action":
-        """Create Action from dictionary, handling datetime parsing."""
-        created_at = data["created_at"]
-        if isinstance(created_at, str):
-            # Try multiple datetime formats
-            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]:
-                try:
-                    created_at = datetime.strptime(created_at, fmt)
-                    break
-                except ValueError:
-                    continue
-            else:
-                created_at = datetime.now()
+        """Create Action from dictionary, handling datetime parsing.
+
+        Raises MalformedActionError if the row cannot be parsed.
+        """
+        created_at = parse_timestamp(data["created_at"])
+        if not data.get("action_id") or not data.get("author_user_id"):
+            raise MalformedActionError("missing action_id or author_user_id")
 
         return cls(
             action_id=data["action_id"],
@@ -212,10 +304,17 @@ class ArchetypeLearner:
         filepath: str,
         show_progress: bool = True,
         stream_mode: bool = False,
-    ) -> None:
+        max_skip_ratio: float = 0.01,
+    ) -> Dict[str, int]:
         """
-        Process actions from CSV file with proper streaming progress.
-        Shows processing speed when total is unknown.
+        Process actions from a CSV file, row by row, without loading it into memory.
+
+        Malformed rows are counted and reported rather than silently dropped. If more
+        than `max_skip_ratio` of rows fail to parse the run aborts: a systematically
+        unparseable column (e.g. a timestamp format change) should stop the pipeline,
+        not quietly degrade every downstream metric.
+
+        Returns a dict with the processed/skipped counts.
         """
 
         with open(filepath, "r", encoding="utf-8") as f:
@@ -238,7 +337,12 @@ class ArchetypeLearner:
                     unit=" actions",
                 )
 
+            n_read = 0
+            n_skipped = 0
+            first_error: Optional[str] = None
+
             for row in reader:
+                n_read += 1
 
                 try:
 
@@ -248,12 +352,27 @@ class ArchetypeLearner:
                     if pbar is not None:
                         pbar.update()
 
-                except Exception as e:
-                    # Skip malformed rows
-                    continue
+                except MalformedActionError as exc:
+                    n_skipped += 1
+                    if first_error is None:
+                        first_error = str(exc)
+                    if pbar is not None:
+                        pbar.update()
 
             if pbar is not None:
                 pbar.close()
+
+        if n_read and (n_skipped / n_read) > max_skip_ratio:
+            raise MalformedActionError(
+                f"{n_skipped}/{n_read} rows ({100 * n_skipped / n_read:.1f}%) could not be "
+                f"parsed in {filepath}, above the {100 * max_skip_ratio:.1f}% tolerance. "
+                f"First error: {first_error}"
+            )
+
+        if n_skipped:
+            print(f"  skipped {n_skipped}/{n_read} malformed rows (first: {first_error})")
+
+        return {"read": n_read, "processed": n_read - n_skipped, "skipped": n_skipped}
 
     def _extract_archetype_vectors(
         self,

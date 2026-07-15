@@ -42,6 +42,7 @@ The (alpha, delta) sweep re-scores an in-memory buffer; the archive is read once
 window, not once per grid point.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -94,11 +95,76 @@ class TuningResult:
     alpha: float
     delta: timedelta
     ndcg: Dict[int, float]
+    #: Standard deviation of nDCG across window pairs, when fitted on more than one.
+    ndcg_std: Dict[int, float] = None
+    #: How many (t, t+1) pairs this was averaged over.
+    n_pairs: int = 1
+    #: Per-pair nDCG@100, for inspecting stability.
+    per_pair: Tuple[float, ...] = ()
 
     @property
     def score(self) -> float:
         """The figure optimised: nDCG@100, the top-k regime the paper cares about."""
         return self.ndcg.get(100, 0.0)
+
+    @property
+    def std(self) -> float:
+        return (self.ndcg_std or {}).get(100, 0.0)
+
+
+def aggregate(per_pair_results: Sequence[Sequence[TuningResult]]) -> List[TuningResult]:
+    """Average a grid across several (t, t+1) window pairs.
+
+    Fitting on a single period overfits it. Measured on this archive: the TASH optimum
+    is (alpha=0.7, delta=15min) on the E1 pair and (alpha=0.5, delta=2d) on the E2 pair
+    -- a 192x disagreement in delta, from the same dataset. Both are noise on a surface
+    that is flat to within ~0.01 nDCG across a wide region, and adopting either one
+    costs the other period real accuracy. Parameters belong to the dataset, so they are
+    fitted across pairs spanning the whole observation period.
+    """
+    if not per_pair_results:
+        return []
+
+    buckets: Dict[Tuple[str, float, timedelta], List[TuningResult]] = defaultdict(list)
+    for pair in per_pair_results:
+        for r in pair:
+            buckets[(r.metric, r.alpha, r.delta)].append(r)
+
+    out: List[TuningResult] = []
+    for (metric, alpha, delta), rows in buckets.items():
+        ks = sorted(rows[0].ndcg)
+        mean = {k: float(np.mean([r.ndcg[k] for r in rows])) for k in ks}
+        std = {k: float(np.std([r.ndcg[k] for r in rows])) for k in ks}
+        out.append(
+            TuningResult(
+                metric=metric,
+                alpha=alpha,
+                delta=delta,
+                ndcg=mean,
+                ndcg_std=std,
+                n_pairs=len(rows),
+                per_pair=tuple(r.ndcg.get(100, 0.0) for r in rows),
+            )
+        )
+    return out
+
+
+def plateau(results: Sequence[TuningResult], metric: str, tolerance: float = 0.01):
+    """Every (alpha, delta) within `tolerance` nDCG of the best.
+
+    The honest unit of reporting when the surface is flat. Quoting a bare argmax
+    implies a precision the data does not support: on this archive the top of the TASH
+    surface spans delta from 15min to 6h within 0.01 nDCG, so the argmax is a coin
+    toss between settings that perform identically. A reviewer asking "why this delta?"
+    is better answered with "anything in this region is equivalent, we took X" than
+    with a number that a re-run would move.
+    """
+    rows = [r for r in results if r.metric == metric]
+    if not rows:
+        return [], None
+    best = max(rows, key=lambda r: r.score)
+    near = [r for r in rows if best.score - r.score <= tolerance]
+    return sorted(near, key=lambda r: -r.score), best
 
 
 def involvement_target(
@@ -185,31 +251,65 @@ def _fmt_delta(d: timedelta) -> str:
     return f"{s / 86400:g}d"
 
 
-def format_grid(results: Sequence[TuningResult], metric: str) -> str:
+def format_grid(
+    results: Sequence[TuningResult], metric: str, tolerance: float = 0.01
+) -> str:
     """The (alpha, delta) nDCG@100 surface, as a text table.
 
     The analogue of the optimisation grid figure in Verdolotti et al. Printing the
     whole surface, not just the argmax, is what lets a reader see whether the optimum
     is a plateau or a spike -- and therefore how much the choice actually matters.
+
+    Cells within `tolerance` of the best are marked '+', the best '*'. If the '+'
+    region is large, the argmax is not meaningful and the paper should say so.
     """
     rows = [r for r in results if r.metric == metric]
     if not rows:
         return ""
     alphas = sorted({r.alpha for r in rows})
     deltas = sorted({r.delta for r in rows})
+    n_pairs = rows[0].n_pairs
 
-    out = [f"nDCG@100 surface for {metric}", ""]
+    near, best = plateau(rows, metric, tolerance)
+    near_set = {(r.alpha, r.delta) for r in near}
+
+    header = f"nDCG@100 surface for {metric}"
+    if n_pairs > 1:
+        header += f"  (mean of {n_pairs} window pairs)"
+    out = [header, ""]
     out.append("  delta \\ alpha  " + "".join(f"{a:>8.1f}" for a in alphas))
-    best = max(rows, key=lambda r: r.score)
     for d in deltas:
         cells = []
         for a in alphas:
             hit = next((r for r in rows if r.alpha == a and r.delta == d), None)
             v = hit.score if hit else float("nan")
-            mark = "*" if hit is best else " "
+            if hit is best:
+                mark = "*"
+            elif (a, d) in near_set:
+                mark = "+"
+            else:
+                mark = " "
             cells.append(f"{v:>7.4f}{mark}")
         out.append(f"  {_fmt_delta(d):<14}" + "".join(cells))
     out.append("")
-    out.append(f"  best: alpha={best.alpha:.1f}, delta={_fmt_delta(best.delta)}, "
-               f"nDCG@100={best.score:.4f}  (* above)")
+    out.append(
+        f"  best: alpha={best.alpha:.1f}, delta={_fmt_delta(best.delta)}, "
+        f"nDCG@100={best.score:.4f}"
+        + (f" +/- {best.std:.4f} across pairs" if n_pairs > 1 else "")
+    )
+    out.append(
+        f"  plateau: {len(near)}/{len(rows)} settings within {tolerance:.3f} nDCG "
+        f"of the best (marked + above)"
+    )
+    if len(near) > max(3, len(rows) // 10):
+        d_lo, d_hi = min(r.delta for r in near), max(r.delta for r in near)
+        a_lo, a_hi = min(r.alpha for r in near), max(r.alpha for r in near)
+        out.append(
+            f"  => the surface is FLAT: delta {_fmt_delta(d_lo)}..{_fmt_delta(d_hi)} "
+            f"and alpha {a_lo:.1f}..{a_hi:.1f} all perform within {tolerance:.3f}."
+        )
+        out.append(
+            "     Report the region and the chosen value, not a bare argmax: a re-run "
+            "would move it."
+        )
     return "\n".join(out)

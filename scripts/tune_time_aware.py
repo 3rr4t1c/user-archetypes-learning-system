@@ -48,6 +48,7 @@ import sys
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -58,9 +59,11 @@ from arles.streaming import build_index, discover_files, iter_window  # noqa: E4
 from arles.tuning import (  # noqa: E402
     DEFAULT_ALPHAS,
     DEFAULT_DELTAS,
+    aggregate,
     format_grid,
     grid_search,
     involvement_target,
+    plateau,
 )
 
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -114,10 +117,15 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("path", help="a CSV file, or a directory of sequential CSVs")
-    ap.add_argument("--start", type=parse_cli_datetime, required=True,
-                    help="start of the fitting window (t)")
+    ap.add_argument("--start", type=parse_cli_datetime, default=None,
+                    help="start of the first fitting window (default: archive start)")
     ap.add_argument("--days", type=float, default=5.0,
                     help="window length in days (default: 5, the paper's window)")
+    ap.add_argument("--pairs", type=int, default=6,
+                    help="number of (t, t+1) window pairs to fit across, spread evenly "
+                         "over the archive (default: 6). Parameters belong to the "
+                         "dataset, not to one period: fitted on E1 alone the TASH "
+                         "optimum is delta=15min, on E2 alone it is delta=2d.")
     ap.add_argument("--alphas", default=None,
                     help="comma-separated, e.g. 0.3,0.5,0.7 (default: 0.0..0.9)")
     ap.add_argument("--deltas", default=None,
@@ -142,47 +150,92 @@ def main():
     spans = build_index(files, cache_path=cache, verbose=True)
 
     step = timedelta(days=args.days)
-    fit_start, fit_end = args.start, args.start + step
-    tgt_start, tgt_end = fit_end, fit_end + step
+    archive_start = args.start or spans[0].start
+    archive_end = spans[-1].end
 
-    print(f"\nfitting window (t)  : {fit_start.isoformat()[:19]} -> {fit_end.isoformat()[:19]}")
-    print(f"target window (t+1) : {tgt_start.isoformat()[:19]} -> {tgt_end.isoformat()[:19]}")
-    print("\nreading window t ...")
-    fx, index = load_window(files, spans, fit_start, fit_end)
-    user_ids, _ = fx.finish()
-    print(f"  {index.n_reposts:,} reposts, {len(user_ids):,} users")
+    # Spread the pairs evenly over the observation period. Each pair needs two
+    # consecutive windows, so the last one must start 2*step before the end.
+    usable = (archive_end - archive_start) - 2 * step
+    if usable.total_seconds() <= 0:
+        starts = [archive_start]
+    else:
+        n = max(1, args.pairs)
+        stride = usable / max(n - 1, 1) if n > 1 else timedelta(0)
+        starts = [archive_start + i * stride for i in range(n)]
 
-    print("\nreading window t+1 (target) ...")
-    target_actions = []
-    for row in iter_window(files, tgt_start, tgt_end, spans=spans, progress=True):
-        try:
-            action = map_row(row)
-        except MalformedActionError:
+    print(f"\nfitting {len(starts)} window pair(s) across "
+          f"{archive_start.isoformat()[:10]} -> {archive_end.isoformat()[:10]}")
+    for i, s in enumerate(starts, 1):
+        print(f"  pair {i}: t = {s.isoformat()[:19]} -> {(s+step).isoformat()[:19]}, "
+              f"t+1 = {(s+step).isoformat()[:19]} -> {(s+2*step).isoformat()[:19]}")
+
+    per_pair: List[list] = []
+    for i, fit_start in enumerate(starts, 1):
+        fit_end = fit_start + step
+        tgt_start, tgt_end = fit_end, fit_end + step
+        print(f"\n{'=' * 72}\nPAIR {i}/{len(starts)}: {fit_start.isoformat()[:19]}\n{'=' * 72}")
+
+        print("reading window t ...")
+        fx, index = load_window(files, spans, fit_start, fit_end)
+        user_ids, _ = fx.finish()
+        print(f"  {index.n_reposts:,} reposts, {len(user_ids):,} users")
+        if not user_ids:
+            print("  empty window; skipping this pair.")
             continue
-        if action.activity_type == "repost":
-            target_actions.append(action)
-    target = involvement_target(target_actions, user_ids)
-    print(f"  {len(target_actions):,} reposts; "
-          f"{int((target > 0).sum()):,}/{len(user_ids):,} users still active")
 
-    print(f"\ngrid search: {len(alphas)} alphas x {len(deltas)} deltas")
-    best_tash, best_tai, results = grid_search(
-        fx, target, alphas=alphas, deltas=deltas, progress=True
-    )
+        print("reading window t+1 (target) ...")
+        target_actions = []
+        for row in iter_window(files, tgt_start, tgt_end, spans=spans, progress=True):
+            try:
+                action = map_row(row)
+            except MalformedActionError:
+                continue
+            if action.activity_type == "repost":
+                target_actions.append(action)
+        target = involvement_target(target_actions, user_ids)
+        active = int((target > 0).sum())
+        print(f"  {len(target_actions):,} reposts; {active:,}/{len(user_ids):,} "
+              f"users still active")
+        if active == 0:
+            print("  no user survives into t+1; nDCG undefined. Skipping this pair.")
+            continue
+
+        print(f"grid search: {len(alphas)} alphas x {len(deltas)} deltas")
+        _, _, results = grid_search(
+            fx, target, alphas=alphas, deltas=deltas, progress=False
+        )
+        per_pair.append(results)
+        del fx, index, target_actions
+
+    if not per_pair:
+        print("\nNo usable window pair. Nothing fitted.")
+        return
+
+    merged = aggregate(per_pair)
 
     print()
-    print(format_grid(results, "tash_index"))
+    print(format_grid(merged, "tash_index"))
     print()
-    print(format_grid(results, "tai_score"))
+    print(format_grid(merged, "tai_score"))
 
     print()
     print("=" * 72)
-    print("RESULT (quote these in the paper)")
+    print(f"RESULT: fitted on the dataset ({len(per_pair)} window pairs)")
     print("=" * 72)
-    for r, prior in ((best_tash, "alpha=0.5, delta=14d"), (best_tai, "alpha=0.6, delta=18d")):
-        print(f"  {r.metric:<12} alpha={r.alpha:.1f}  delta={_fmt(r.delta)}")
-        print(f"               nDCG@10={r.ndcg.get(10, 0):.4f}  "
-              f"nDCG@100={r.ndcg.get(100, 0):.4f}  nDCG@1000={r.ndcg.get(1000, 0):.4f}")
+    for metric, prior in (
+        ("tash_index", "alpha=0.5, delta=14d"),
+        ("tai_score", "alpha=0.6, delta=18d"),
+    ):
+        near, best = plateau(merged, metric)
+        print(f"  {metric:<12} alpha={best.alpha:.1f}  delta={_fmt(best.delta)}")
+        print(f"               nDCG@10={best.ndcg.get(10, 0):.4f}  "
+              f"nDCG@100={best.ndcg.get(100, 0):.4f}  "
+              f"nDCG@1000={best.ndcg.get(1000, 0):.4f}")
+        if best.n_pairs > 1:
+            spread = ", ".join(f"{v:.3f}" for v in best.per_pair)
+            print(f"               per-pair nDCG@100: {spread}")
+            print(f"               std across pairs: {best.std:.4f}")
+        print(f"               plateau: {len(near)} settings within 0.01 nDCG")
         print(f"               (Verdolotti et al.: {prior})")
     print(f"\nelapsed: {(time.time() - t0)/60:.1f} min")
 

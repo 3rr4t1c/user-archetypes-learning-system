@@ -54,10 +54,14 @@ from .schema import CanonicalAction
 
 #: Grid searched by default.
 #:
-#: delta is capped well below a 5-day window: at delta >= the window the EMA has one
-#: term and the metric stops being time-aware. The upper end (2 days) still leaves only
-#: 2-3 slots, and is included so the sweep can show that rather than assume it.
-DEFAULT_ALPHAS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+#: The first sweep over 6 window pairs put BOTH optima on a grid edge: TASH rose
+#: monotonically in alpha to the 0.9 boundary (0.630 -> 0.750 at delta=1h) and TAI rose
+#: monotonically in delta to the 2d boundary (0.622 -> 0.797 at alpha=0.4). An argmax on
+#: an edge is not an optimum, it is where the grid stopped. Both directions point the
+#: same way -- longer memory, fewer slots -- i.e. towards the metric's own static
+#: counterpart, so the grid now runs all the way there and the baselines are scored
+#: alongside (see STATIC_BASELINES).
+DEFAULT_ALPHAS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 DEFAULT_DELTAS = (
     timedelta(minutes=15),
     timedelta(minutes=30),
@@ -67,7 +71,17 @@ DEFAULT_DELTAS = (
     timedelta(hours=12),
     timedelta(days=1),
     timedelta(days=2),
+    timedelta(days=5),  # one slot for a 5-day window: the EMA degenerates to static
 )
+
+#: The static rankings the time-aware ones must beat to justify their existence.
+#:
+#: Verdolotti et al. evaluate the TASH-Index and TAI-Score against exactly these, and
+#: report that TASH closely follows their ML model while the H-Index and Influence Score
+#: "consistently underperform". That comparison has to be repeated here rather than
+#: assumed: if influence_score alone matches TAI, the time-aware variant is buying
+#: nothing on this data and does not deserve a slot in the feature bucket.
+STATIC_BASELINES = ("influence_score", "h_index")
 
 
 def ndcg_at_k(scores: np.ndarray, relevance: np.ndarray, k: int) -> float:
@@ -149,21 +163,58 @@ def aggregate(per_pair_results: Sequence[Sequence[TuningResult]]) -> List[Tuning
     return out
 
 
-def plateau(results: Sequence[TuningResult], metric: str, tolerance: float = 0.01):
-    """Every (alpha, delta) within `tolerance` nDCG of the best.
+def beats_on_every_pair(best: TuningResult, other: TuningResult) -> bool:
+    """Did `best` outscore `other` on every single window pair?
 
-    The honest unit of reporting when the surface is flat. Quoting a bare argmax
-    implies a precision the data does not support: on this archive the top of the TASH
-    surface spans delta from 15min to 6h within 0.01 nDCG, so the argmax is a coin
-    toss between settings that perform identically. A reviewer asking "why this delta?"
-    is better answered with "anything in this region is equivalent, we took X" than
-    with a number that a re-run would move.
+    A sign test, which is the right instrument for this design and this n. The same
+    window pairs score every setting, so their scores are paired -- and the variation
+    between pairs is mostly pair *difficulty*, not setting quality. Measured on 6 pairs:
+    nDCG@100 was 0.442, 0.898, 0.607, 0.871, 0.845, 0.834 for TASH and 0.494, 0.902,
+    0.701, 0.920, 0.882, 0.885 for TAI -- pair 1 is the outlier for both, because early
+    August is sparse for every setting alike.
+
+    That common difficulty inflates the unpaired standard deviation to ~0.16, which
+    swamps the ~0.01 differences between settings and makes "mean +/- std" useless: it
+    would call 43 of 80 settings indistinguishable. Paired, it cancels.
+
+    With n = 6, winning all six is p = 2^-6 = 0.016 one-sided; five of six is p = 0.11,
+    which is not evidence. So the bar is a clean sweep.
+    """
+    if not best.per_pair or not other.per_pair:
+        return False
+    if len(best.per_pair) != len(other.per_pair):
+        return False
+    if best is other:
+        return False
+    return all(b > o for b, o in zip(best.per_pair, other.per_pair))
+
+
+def plateau(
+    results: Sequence[TuningResult],
+    metric: str,
+    tolerance: float = 0.01,
+    paired: bool = True,
+):
+    """The settings that cannot be distinguished from the best.
+
+    With `paired` (the default, and correct when every setting was scored on the same
+    window pairs), a setting is excluded only if the best beats it on *every* pair.
+    Everything else is in the plateau: the data does not separate them.
+
+    Without per-pair data, falls back to an absolute `tolerance` -- which is what the
+    first version did, and it reported "plateau: 2/80" on a surface whose standard
+    error was 0.068, i.e. 16x the tolerance. That was false precision: the honest
+    answer was 43/80.
     """
     rows = [r for r in results if r.metric == metric]
     if not rows:
         return [], None
     best = max(rows, key=lambda r: r.score)
-    near = [r for r in rows if best.score - r.score <= tolerance]
+
+    if paired and best.per_pair and len(best.per_pair) > 1:
+        near = [r for r in rows if r is best or not beats_on_every_pair(best, r)]
+    else:
+        near = [r for r in rows if best.score - r.score <= tolerance]
     return sorted(near, key=lambda r: -r.score), best
 
 
@@ -190,6 +241,34 @@ def involvement_target(
     return target
 
 
+def baseline_results(
+    extractor: FeatureExtractor,
+    target: np.ndarray,
+    ks: Sequence[int] = (10, 100, 1000),
+) -> List[TuningResult]:
+    """Score the static rankings the time-aware metrics have to beat.
+
+    Reported as TuningResults with alpha/delta of None so they sit alongside the grid.
+    Without these the sweep can only say which TASH is the best TASH -- never whether
+    any TASH is worth having.
+    """
+    from .features import FEATURE_NAMES
+
+    _, X = extractor.finish()
+    out: List[TuningResult] = []
+    for name in STATIC_BASELINES:
+        col = X[:, FEATURE_NAMES.index(name)]
+        out.append(
+            TuningResult(
+                metric=name,
+                alpha=float("nan"),
+                delta=timedelta(0),
+                ndcg={k: ndcg_at_k(col, target, k) for k in ks},
+            )
+        )
+    return out
+
+
 def grid_search(
     extractor: FeatureExtractor,
     target: np.ndarray,
@@ -197,8 +276,9 @@ def grid_search(
     deltas: Sequence[timedelta] = DEFAULT_DELTAS,
     ks: Sequence[int] = (10, 100, 1000),
     progress: bool = True,
+    include_baselines: bool = True,
 ) -> Tuple[TuningResult, TuningResult, List[TuningResult]]:
-    """Sweep (alpha, delta) for TASH and TAI.
+    """Sweep (alpha, delta) for TASH and TAI, plus the static baselines.
 
     Returns (best_tash, best_tai, all_results). The extractor's buffer is built once
     and re-scored per grid point; the archive is not re-read.
@@ -208,6 +288,8 @@ def grid_search(
     origin = extractor.window_start.timestamp()
 
     results: List[TuningResult] = []
+    if include_baselines:
+        results.extend(baseline_results(extractor, target, ks))
     total = len(alphas) * len(deltas)
     done = 0
 
@@ -240,6 +322,43 @@ def grid_search(
     best_tash = max((r for r in results if r.metric == "tash_index"), key=lambda r: r.score)
     best_tai = max((r for r in results if r.metric == "tai_score"), key=lambda r: r.score)
     return best_tash, best_tai, results
+
+
+def format_baselines(results: Sequence[TuningResult]) -> str:
+    """The comparison that decides whether the time-aware features earn their slot."""
+    rows = [r for r in results if r.metric in STATIC_BASELINES]
+    if not rows:
+        return ""
+    out = ["Static baselines vs the best time-aware setting", ""]
+    n_pairs = rows[0].n_pairs
+    for r in sorted(rows, key=lambda r: -r.score):
+        line = f"  {r.metric:<16} nDCG@100={r.score:.4f}"
+        if n_pairs > 1:
+            line += f" +/- {r.std:.4f}"
+        out.append(line)
+
+    for metric in ("tash_index", "tai_score"):
+        near, best = plateau(results, metric)
+        if best is None:
+            continue
+        out.append(f"  {metric:<16} nDCG@100={best.score:.4f} "
+                   f"(alpha={best.alpha:.2f}, delta={_fmt_delta(best.delta)})")
+        for b in rows:
+            if not b.per_pair or not best.per_pair:
+                continue
+            wins = sum(1 for x, y in zip(best.per_pair, b.per_pair) if x > y)
+            n = len(best.per_pair)
+            verdict = (
+                f"beats {b.metric} on {wins}/{n} pairs"
+                if wins == n
+                else f"does NOT consistently beat {b.metric} ({wins}/{n} pairs)"
+            )
+            out.append(f"      -> {verdict}")
+    out.append("")
+    out.append("  If a time-aware metric does not consistently beat its static")
+    out.append("  counterpart, it is not earning its place in the feature bucket and")
+    out.append("  the paper should say so rather than include it for symmetry.")
+    return "\n".join(out)
 
 
 def _fmt_delta(d: timedelta) -> str:

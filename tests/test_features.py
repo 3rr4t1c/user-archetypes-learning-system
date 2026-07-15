@@ -283,3 +283,29 @@ def test_no_nans_or_infs_ever_reach_the_matrix():
     actions = [repost("u1", "p1", "alice", 0)]
     _, X, _ = extract(actions)
     assert np.all(np.isfinite(X))
+
+
+def test_buffer_roundtrips_through_the_cache(tmp_path):
+    """Caching must be exact: a cached window has to score identically to a fresh read.
+
+    This is what makes re-scoring a new grid a minutes-long job instead of the 4.5-hour
+    archive re-read the first sweep cost.
+    """
+    actions = [repost(f"u{i%7}", f"p{i%4}", f"a{i%3}", i * 0.5) for i in range(120)]
+    index = WindowIndex.build(actions)
+
+    fx = FeatureExtractor(index, START, END)
+    for a in actions:
+        fx.add(a)
+    ids_a, X_a = fx.finish()
+
+    path = str(tmp_path / "win.npz")
+    fx.save_buffer(path)
+
+    fx2 = FeatureExtractor.load_buffer(path, index)
+    ids_b, X_b = fx2.finish()
+
+    assert ids_a == ids_b
+    assert np.allclose(X_a, X_b)
+    assert fx2.window_start == fx.window_start
+    assert fx2.window_end == fx.window_end

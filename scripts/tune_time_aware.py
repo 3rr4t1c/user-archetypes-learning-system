@@ -43,6 +43,7 @@ the text with its nDCG.
 """
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -60,6 +61,7 @@ from arles.tuning import (  # noqa: E402
     DEFAULT_ALPHAS,
     DEFAULT_DELTAS,
     aggregate,
+    format_baselines,
     format_grid,
     grid_search,
     involvement_target,
@@ -92,8 +94,34 @@ def parse_delta(text):
     return timedelta(**{unit_map[unit]: v})
 
 
-def load_window(files, spans, start, end, progress=True):
-    """Both passes over one window. Returns (extractor, user_ids)."""
+def _cache_key(start, end):
+    return f"win_{start.strftime('%Y%m%dT%H%M%S')}_{end.strftime('%Y%m%dT%H%M%S')}"
+
+
+def load_window(files, spans, start, end, progress=True, cache_dir=None):
+    """Both passes over one window. Returns (extractor, index).
+
+    Cached to `cache_dir` when given. The first sweep took 4.5 hours and nearly all of
+    it was re-reading the same windows off the external drive to produce identical
+    buffers. With the cache, changing the grid costs minutes.
+    """
+    cache_path = None
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        cache_path = Path(cache_dir) / f"{_cache_key(start, end)}.npz"
+        idx_path = Path(cache_dir) / f"{_cache_key(start, end)}.index.json"
+        if cache_path.exists() and idx_path.exists():
+            if progress:
+                print(f"  cache hit: {cache_path.name}")
+            meta = json.loads(idx_path.read_text())
+            index = WindowIndex(
+                content_reshares={},  # not needed once the buffer is built
+                content_author={},
+                n_reposts=meta["n_reposts"],
+                n_unattributed=meta["n_unattributed"],
+            )
+            return FeatureExtractor.load_buffer(str(cache_path), index), index
+
     index = WindowIndex()
     for row in iter_window(files, start, end, spans=spans, progress=progress):
         try:
@@ -109,6 +137,15 @@ def load_window(files, spans, start, end, progress=True):
         except MalformedActionError:
             continue
         fx.add(action)
+
+    if cache_path:
+        fx.save_buffer(str(cache_path))
+        (Path(cache_dir) / f"{_cache_key(start, end)}.index.json").write_text(
+            json.dumps({"n_reposts": index.n_reposts,
+                        "n_unattributed": index.n_unattributed})
+        )
+        if progress:
+            print(f"  cached: {cache_path.name}")
     return fx, index
 
 
@@ -130,6 +167,14 @@ def main():
                     help="comma-separated, e.g. 0.3,0.5,0.7 (default: 0.0..0.9)")
     ap.add_argument("--deltas", default=None,
                     help="comma-separated, e.g. 15min,1h,6h,1d (default: 15min..2d)")
+    ap.add_argument("--cache-dir", default=".arles_windows",
+                    help="cache each window's buffer here so re-running with a "
+                         "different grid skips the archive entirely (the first "
+                         "sweep spent 4.5h almost entirely on re-reads). Pass '' "
+                         "to disable.")
+    ap.add_argument("--save", default=None,
+                    help="write the full per-pair surface to JSON, so re-analysis "
+                         "never needs a re-run")
     ap.add_argument("--index-cache", default=None)
     args = ap.parse_args()
 
@@ -176,7 +221,8 @@ def main():
         print(f"\n{'=' * 72}\nPAIR {i}/{len(starts)}: {fit_start.isoformat()[:19]}\n{'=' * 72}")
 
         print("reading window t ...")
-        fx, index = load_window(files, spans, fit_start, fit_end)
+        fx, index = load_window(files, spans, fit_start, fit_end,
+                                cache_dir=args.cache_dir or None)
         user_ids, _ = fx.finish()
         print(f"  {index.n_reposts:,} reposts, {len(user_ids):,} users")
         if not user_ids:
@@ -217,6 +263,19 @@ def main():
     print(format_grid(merged, "tash_index"))
     print()
     print(format_grid(merged, "tai_score"))
+    print()
+    print(format_baselines(merged))
+
+    if args.save:
+        payload = [
+            {"metric": r.metric, "alpha": r.alpha,
+             "delta_seconds": r.delta.total_seconds(), "ndcg": r.ndcg,
+             "ndcg_std": r.ndcg_std, "n_pairs": r.n_pairs,
+             "per_pair": list(r.per_pair)}
+            for r in merged
+        ]
+        Path(args.save).write_text(json.dumps(payload, indent=2))
+        print(f"\nfull surface written to {args.save}")
 
     print()
     print("=" * 72)

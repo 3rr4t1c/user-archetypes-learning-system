@@ -142,7 +142,46 @@ def test_grid_search_finds_a_planted_optimum():
     assert best_tash.metric == "tash_index"
     assert best_tai.metric == "tai_score"
     assert 0.0 <= best_tash.score <= 1.0
-    assert len(results) == 3 * 2 * 2  # alphas x deltas x metrics
+    # alphas x deltas x 2 time-aware metrics, plus the 2 static baselines
+    assert len(results) == 3 * 2 * 2 + 2
+
+
+def test_grid_search_scores_the_static_baselines():
+    """Without these the sweep can say which TASH is best, never whether TASH is worth
+    having. Verdolotti et al. compare against exactly these two."""
+    actions = _planted_window()
+    index = WindowIndex.build(actions)
+    fx = FeatureExtractor(index, START, END)
+    for a in actions:
+        fx.add(a)
+    ids, _ = fx.finish()
+    target = involvement_target(
+        [repost(f"n{i}", f"np{i}", "steady", 1) for i in range(20)], ids
+    )
+    _, _, results = grid_search(
+        fx, target, alphas=(0.5,), deltas=(timedelta(hours=6),), ks=(100,),
+        progress=False,
+    )
+    assert {r.metric for r in results} == {
+        "tash_index", "tai_score", "influence_score", "h_index"
+    }
+
+
+def test_baselines_can_be_switched_off():
+    actions = _planted_window()
+    index = WindowIndex.build(actions)
+    fx = FeatureExtractor(index, START, END)
+    for a in actions:
+        fx.add(a)
+    ids, _ = fx.finish()
+    target = involvement_target(
+        [repost(f"n{i}", f"np{i}", "steady", 1) for i in range(5)], ids
+    )
+    _, _, results = grid_search(
+        fx, target, alphas=(0.5,), deltas=(timedelta(hours=6),), ks=(100,),
+        progress=False, include_baselines=False,
+    )
+    assert {r.metric for r in results} == {"tash_index", "tai_score"}
 
 
 def test_grid_search_returns_the_argmax():
@@ -163,10 +202,17 @@ def test_grid_search_returns_the_argmax():
     assert best_tash.score == max(r.score for r in tash_rows)
 
 
-def test_default_grid_keeps_delta_below_the_window():
-    """delta >= the analysis window leaves the EMA a single term, which is the bug
-    that carrying over delta=14 days would have reintroduced."""
-    assert max(DEFAULT_DELTAS) < timedelta(days=5)
+def test_default_grid_reaches_the_static_degenerate_point():
+    """delta == the window means one slot: the EMA degenerates to the static metric.
+
+    The first sweep put both optima on a grid edge -- TASH rising monotonically to
+    alpha=0.9, TAI to delta=2d -- so the grid had not contained the optimum, it had
+    merely stopped. Both directions point towards less time-awareness, so the grid now
+    runs all the way to the degenerate point instead of assuming the answer lies short
+    of it. delta must never *exceed* the window, which would be meaningless.
+    """
+    assert max(DEFAULT_DELTAS) == timedelta(days=5)      # the 5-day analysis window
+    assert 0.99 in DEFAULT_ALPHAS                        # alpha runs to its own edge
     assert 0.5 in DEFAULT_ALPHAS and 0.6 in DEFAULT_ALPHAS  # the prior work's optima
 
 

@@ -327,6 +327,51 @@ class FeatureExtractor:
             np.asarray(self._content_n, dtype=np.int64),
         )
 
+    def save_buffer(self, path: str) -> None:
+        """Persist the pass-2 buffer so a window never has to be re-read.
+
+        Reading a window off the external archive costs minutes; re-scoring an
+        in-memory buffer costs seconds. The first parameter sweep spent 4.5 hours, and
+        almost all of it was I/O that produced the same six buffers over and over. With
+        these cached, changing the grid is a minutes-long job, which is the difference
+        between "we can check that" and "we'd rather not".
+        """
+        np.savez_compressed(
+            path,
+            ts=np.asarray(self._ts, dtype=np.float64),
+            content=np.asarray(self._content, dtype=np.int64),
+            actor=np.asarray(self._actor, dtype=np.int64),
+            content_author=np.asarray(self._content_author_idx, dtype=np.int64),
+            content_n=np.asarray(self._content_n, dtype=np.int64),
+            actor_ids=np.asarray(self._actor_ids, dtype="U40"),
+            window=np.asarray(
+                [self.window_start.timestamp(), self.window_end.timestamp()],
+                dtype=np.float64,
+            ),
+        )
+
+    @classmethod
+    def load_buffer(cls, path: str, index: "WindowIndex", **kwargs) -> "FeatureExtractor":
+        """Rebuild an extractor from a cached buffer, skipping both archive passes."""
+        from datetime import timezone
+
+        blob = np.load(path, allow_pickle=False)
+        start_ts, end_ts = blob["window"]
+        fx = cls(
+            index,
+            datetime.fromtimestamp(float(start_ts), tz=timezone.utc),
+            datetime.fromtimestamp(float(end_ts), tz=timezone.utc),
+            **kwargs,
+        )
+        fx._ts = list(blob["ts"])
+        fx._content = list(blob["content"])
+        fx._actor = list(blob["actor"])
+        fx._content_author_idx = list(blob["content_author"])
+        fx._content_n = list(blob["content_n"])
+        fx._actor_ids = [str(a) for a in blob["actor_ids"]]
+        fx._actor_index = {a: i for i, a in enumerate(fx._actor_ids)}
+        return fx
+
     def finish(self) -> Tuple[List[str], np.ndarray]:
         """Return (user_ids, X) with X of shape (n_users, 12)."""
         n_actors = len(self._actor_ids)

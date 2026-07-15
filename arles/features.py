@@ -154,6 +154,76 @@ def h_index(counts: Sequence[int]) -> int:
     return h
 
 
+def time_aware_scores(
+    ts: np.ndarray,
+    content: np.ndarray,
+    content_author: np.ndarray,
+    n_actors: int,
+    origin: float,
+    slot_seconds: float,
+    tash_alpha: float,
+    tai_alpha: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """EMAs of per-slot influence score (TAI) and per-slot social h-index (TASH).
+
+    Split out of FeatureExtractor so that arles.tuning can re-evaluate it across an
+    (alpha, delta) grid without re-reading the archive: the sorted buffer is built
+    once and this is called per grid point.
+
+    Every author seen so far is decayed at every slot boundary, including slots in
+    which they were reshared zero times -- TASH_t = alpha*TASH_{t-1} + (1-alpha)*H_t
+    with H_t = 0. The original implementation only updated authors active in the slot,
+    which let a single early burst persist undecayed for the rest of the window.
+
+    Args:
+        ts: repost timestamps, ascending.
+        content: content slot per repost.
+        content_author: author slot per content slot.
+        origin: POSIX timestamp the slot grid starts from.
+    """
+    tai = np.zeros(n_actors, dtype=np.float64)
+    tash = np.zeros(n_actors, dtype=np.float64)
+    if ts.shape[0] == 0:
+        return tai, tash
+
+    seeded = np.zeros(n_actors, dtype=bool)
+    seen_author = np.zeros(n_actors, dtype=bool)
+    slot_of = np.floor((ts - origin) / slot_seconds).astype(np.int64)
+
+    def flush(slot_counts: Dict[int, Dict[int, int]]) -> None:
+        slot_influence = np.zeros(n_actors, dtype=np.float64)
+        slot_h = np.zeros(n_actors, dtype=np.float64)
+        for a_slot, per_content in slot_counts.items():
+            vals = list(per_content.values())
+            slot_influence[a_slot] = float(sum(vals))
+            slot_h[a_slot] = float(h_index(vals))
+            seen_author[a_slot] = True
+
+        active = seen_author
+        fresh = active & ~seeded
+        tai[fresh] = slot_influence[fresh]
+        tash[fresh] = slot_h[fresh]
+        seeded[fresh] = True
+
+        old = active & ~fresh
+        tai[old] = tai_alpha * tai[old] + (1 - tai_alpha) * slot_influence[old]
+        tash[old] = tash_alpha * tash[old] + (1 - tash_alpha) * slot_h[old]
+
+    current = slot_of[0]
+    buffer: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for i in range(ts.shape[0]):
+        s = slot_of[i]
+        if s != current:
+            flush(buffer)
+            buffer = defaultdict(lambda: defaultdict(int))
+            current = s
+        a_slot = int(content_author[content[i]])
+        buffer[a_slot][int(content[i])] += 1
+    flush(buffer)
+
+    return tai, tash
+
+
 class FeatureExtractor:
     """Pass 2: build the per-user feature matrix for one window.
 
@@ -236,24 +306,34 @@ class FeatureExtractor:
 
     # ------------------------------------------------------------------ finishing
 
+    def sorted_buffer(self):
+        """(ts, content, actor, content_author, content_n), chronologically sorted.
+
+        The archive is ingestion-ordered and created_at is client-supplied, so rows
+        arrive out of chronological order by up to ~18.6 h. Co-action windows, reshare
+        ranks and EMA slots all assume time order, so sorting happens once here and
+        everything downstream consumes the result. arles.tuning reuses this buffer to
+        sweep an (alpha, delta) grid without touching the disk again.
+        """
+        ts = np.asarray(self._ts, dtype=np.float64)
+        content = np.asarray(self._content, dtype=np.int64)
+        actor = np.asarray(self._actor, dtype=np.int64)
+        order = np.argsort(ts, kind="stable")
+        return (
+            ts[order],
+            content[order],
+            actor[order],
+            np.asarray(self._content_author_idx, dtype=np.int64),
+            np.asarray(self._content_n, dtype=np.int64),
+        )
+
     def finish(self) -> Tuple[List[str], np.ndarray]:
         """Return (user_ids, X) with X of shape (n_users, 12)."""
         n_actors = len(self._actor_ids)
         if not self._ts or n_actors == 0:
             return [], np.zeros((0, len(FEATURE_NAMES)), dtype=np.float64)
 
-        ts = np.asarray(self._ts, dtype=np.float64)
-        content = np.asarray(self._content, dtype=np.int64)
-        actor = np.asarray(self._actor, dtype=np.int64)
-
-        # The archive is ingestion-ordered and created_at is client-supplied, so the
-        # rows arrive out of chronological order. Everything below -- co-action
-        # windows, reshare ranks, EMA slots -- assumes time order.
-        order = np.argsort(ts, kind="stable")
-        ts, content, actor = ts[order], content[order], actor[order]
-
-        content_n = np.asarray(self._content_n, dtype=np.int64)
-        content_author = np.asarray(self._content_author_idx, dtype=np.int64)
+        ts, content, actor, content_author, content_n = self.sorted_buffer()
 
         f = {name: np.zeros(n_actors, dtype=np.float64) for name in FEATURE_NAMES}
 
@@ -270,12 +350,16 @@ class FeatureExtractor:
             f["h_index"][a_slot] = h_index(counts)
 
         # tai_score / tash_index: EMAs over per-slot influence and per-slot h-index.
-        #
-        # Every author seen is decayed every slot, including slots in which they were
-        # reshared zero times: TASH_t = alpha*TASH_{t-1} + (1-alpha)*H_t with H_t = 0.
-        # The original implementation only updated authors active in the slot, which
-        # let a single early burst persist undecayed for the rest of the window.
-        self._accumulate_time_aware(ts, content, content_author, f, n_actors)
+        f["tai_score"], f["tash_index"] = time_aware_scores(
+            ts,
+            content,
+            content_author,
+            n_actors,
+            origin=self.window_start.timestamp(),
+            slot_seconds=self.slot_seconds,
+            tash_alpha=self.tash_alpha,
+            tai_alpha=self.tai_alpha,
+        )
 
         # ---------------------------------------------------------------- amplifier
         counts = np.bincount(actor, minlength=n_actors).astype(np.float64)
@@ -330,55 +414,6 @@ class FeatureExtractor:
         return list(self._actor_ids), X
 
     # ------------------------------------------------------------------ internals
-
-    def _accumulate_time_aware(self, ts, content, content_author, f, n_actors) -> None:
-        """EMAs of per-slot influence score and per-slot social h-index."""
-        if ts.shape[0] == 0:
-            return
-
-        slot_of = np.floor(
-            (ts - self.window_start.timestamp()) / self.slot_seconds
-        ).astype(np.int64)
-
-        tai = np.zeros(n_actors, dtype=np.float64)
-        tash = np.zeros(n_actors, dtype=np.float64)
-        seeded = np.zeros(n_actors, dtype=bool)
-        seen_author = np.zeros(n_actors, dtype=bool)
-
-        def flush(slot_counts: Dict[int, Dict[int, int]]) -> None:
-            # Per-slot influence and h-index for the authors reshared in this slot.
-            slot_influence = np.zeros(n_actors, dtype=np.float64)
-            slot_h = np.zeros(n_actors, dtype=np.float64)
-            for a_slot, per_content in slot_counts.items():
-                vals = list(per_content.values())
-                slot_influence[a_slot] = float(sum(vals))
-                slot_h[a_slot] = float(h_index(vals))
-                seen_author[a_slot] = True
-
-            active = seen_author  # decay every author seen so far, zero or not
-            fresh = active & ~seeded
-            tai[fresh] = slot_influence[fresh]
-            tash[fresh] = slot_h[fresh]
-            seeded[fresh] = True
-
-            old = active & seeded & ~fresh
-            tai[old] = self.tai_alpha * tai[old] + (1 - self.tai_alpha) * slot_influence[old]
-            tash[old] = self.tash_alpha * tash[old] + (1 - self.tash_alpha) * slot_h[old]
-
-        current = slot_of[0] if slot_of.shape[0] else 0
-        buffer: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        for i in range(ts.shape[0]):
-            s = slot_of[i]
-            if s != current:
-                flush(buffer)
-                buffer = defaultdict(lambda: defaultdict(int))
-                current = s
-            a_slot = int(content_author[content[i]])
-            buffer[a_slot][int(content[i])] += 1
-        flush(buffer)
-
-        f["tai_score"] = tai
-        f["tash_index"] = tash
 
     def _accumulate_co_action(self, ts, content, actor, content_n, f, n_actors) -> None:
         """Co-action against a sliding window, keyed by content.

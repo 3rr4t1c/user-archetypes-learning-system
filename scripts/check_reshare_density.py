@@ -308,20 +308,43 @@ def main():
                   f"{s['max']:>7,} {s['share_h1']:>7.1f} {s['share_h2']:>7.2f} "
                   f"{s['share_h3']:>7.2f}")
 
-        means = [s["mean"] for s in summaries]
-        swing = max(means) / min(means) if min(means) else float("inf")
+        # Report the swing of each quantity separately. Reporting only the mean was
+        # misleading: on the full archive the mean is the *most* stable of them
+        # (E1 1.8x) while the max -- which is the min-max denominator, and therefore
+        # what actually rescales every score -- swings 40x over the same windows.
+        def swing(key):
+            vals = [s[key] for s in summaries]
+            lo, hi = min(vals), max(vals)
+            return (hi / lo if lo else float("inf")), lo, hi
+
         print()
-        print(f"  density swing across windows: {swing:.1f}x "
-              f"(mean reshares/author {min(means):.2f} -> {max(means):.2f})")
-        if swing > 1.5:
+        print("  swing across windows (max/min):")
+        rows = [
+            ("mean reshares/author", "mean", "{:.2f}"),
+            ("authors (population)", "authors", "{:,.0f}"),
+            ("reposts", "reposts", "{:,.0f}"),
+            ("max reshares (min-max denominator)", "max", "{:,.0f}"),
+        ]
+        worst = 1.0
+        for label, key, fmt in rows:
+            r, lo, hi = swing(key)
+            worst = max(worst, r)
+            print(f"    {label:<36} {r:6.1f}x   "
+                  f"({fmt.format(lo)} -> {fmt.format(hi)})")
+
+        max_swing, _, _ = swing("max")
+        pop_swing, _, _ = swing("authors")
+        if worst > 1.5:
             print()
-            print("  CAUTION: the reshare density is not constant across the windows")
-            print("  Figure 8 compares. Each window's scores are min-max rescaled")
-            print("  within that window's own population, so a score of 0.2 in a sparse")
-            print("  window and 0.2 in a dense one are not the same quantity. Fit the")
-            print("  scaler and PCA once on the pooled windows and freeze them, or the")
-            print("  trend line partly tracks how much data each window happened to")
-            print("  contain.")
+            print("  CAUTION: the population Figure 8 compares is not stable.")
+            print(f"  Scores are min-max rescaled within each window, and the maximum")
+            print(f"  swings {max_swing:.0f}x across windows: the same behaviour scores")
+            print(f"  ~{1/max_swing:.3f} in the densest window and 1.0 in the sparsest.")
+            print(f"  The population itself swings {pop_swing:.1f}x, so the pre-event")
+            print("  baseline is measured on a different population from the windows")
+            print("  it is differenced against. Fit the scaler and PCA once on the")
+            print("  pooled windows and freeze them, or the trend partly tracks how")
+            print("  much data each window happened to contain.")
 
     print()
     verdict(summaries[0]["share_h1"], summaries[0]["share_h3"], summaries[0]["max"])

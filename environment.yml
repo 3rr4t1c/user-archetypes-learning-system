@@ -1,0 +1,26 @@
+# conda env create -f environment.yml && conda activate arles
+#
+# The library itself needs numpy and nothing else. Everything below numpy is used by the
+# scripts, the tests, or the figures -- never by arles/ at import time, and scipy/tqdm are
+# imported behind try/except so the library degrades rather than fails without them.
+#
+# Python is pinned to >=3.9 because datetime.fromisoformat is load-bearing (see
+# arles.actions.parse_timestamp). Before 3.11 it rejects a trailing "Z" and any
+# fractional part that is not 3 or 6 digits, both of which occur in real exports, so the
+# parser normalises them itself rather than relying on the interpreter version.
+name: arles
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9,<3.13
+
+  # --- required by arles/ ---
+  - numpy>=1.21
+
+  # --- optional, used by scripts/ ---
+  - scipy>=1.7        # Wilcoxon signed-rank in arles.tuning (falls back to a sign test)
+  - tqdm>=4.60        # progress bars in arles.streaming (silently skipped if absent)
+  - matplotlib>=3.5   # figures
+
+  # --- development ---
+  - pytest>=7.0

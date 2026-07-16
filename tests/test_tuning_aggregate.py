@@ -16,7 +16,13 @@ from datetime import timedelta
 
 import pytest
 
-from arles.tuning import TuningResult, aggregate, format_grid, plateau
+from arles.tuning import (
+    TuningResult,
+    aggregate,
+    beats_on_every_pair,
+    format_grid,
+    plateau,
+)
 
 D15, D1H, D2D = timedelta(minutes=15), timedelta(hours=1), timedelta(days=2)
 
@@ -132,3 +138,59 @@ def test_grid_reports_pair_count_and_spread_when_aggregated():
     grid = format_grid(merged, "tash_index")
     assert "mean of 2 window pairs" in grid
     assert "+/-" in grid
+
+
+# ------------------------------------------------- the NaN-key bug (real, shipped)
+
+
+def _static(metric, score):
+    """A static baseline row, exactly as baseline_results builds it: alpha = NaN."""
+    return TuningResult(metric=metric, alpha=float("nan"), delta=timedelta(0),
+                        ndcg={100: score})
+
+
+def test_static_baselines_are_aggregated_not_split_per_pair():
+    """The regression for a bug that shipped and corrupted a 5.5-hour run's output.
+
+    aggregate() keyed on (metric, alpha, delta) and the baselines carry alpha=NaN.
+    NaN != NaN, so every pair's baseline landed in its own bucket: a 6-pair sweep
+    printed influence_score six times instead of averaging it once, and the paired
+    comparison then zipped a 6-tuple against a 1-tuple, truncated to one element, and
+    reported meaningless "0/6 pairs" verdicts.
+    """
+    pairs = [[_static("influence_score", s)] for s in
+             (0.9196, 0.9141, 0.8904, 0.8867, 0.6288, 0.4860)]
+    merged = aggregate(pairs)
+    assert len(merged) == 1, "NaN alpha split the baseline into one bucket per pair"
+    assert merged[0].n_pairs == 6
+    assert merged[0].score == pytest.approx(0.7876, abs=1e-4)  # the real archive value
+
+
+def test_aggregated_baseline_keeps_a_numeric_alpha():
+    """The sentinel used for keying must not leak into the result object."""
+    merged = aggregate([[_static("h_index", 0.8)], [_static("h_index", 0.6)]])
+    assert merged[0].alpha != merged[0].alpha  # still NaN, not the string "static"
+
+
+def test_baselines_and_grid_rows_coexist_after_aggregation():
+    pairs = []
+    for s in (0.80, 0.60):
+        pairs.append([
+            _static("influence_score", s),
+            TuningResult("tai_score", 0.4, D2D, {100: s + 0.01}),
+        ])
+    merged = aggregate(pairs)
+    assert {r.metric for r in merged} == {"influence_score", "tai_score"}
+    assert all(r.n_pairs == 2 for r in merged)
+
+
+def test_paired_comparison_works_against_an_aggregated_baseline():
+    """Once aggregated, best-vs-baseline is a real 6-vs-6 paired comparison."""
+    inf = aggregate([[_static("influence_score", s)] for s in
+                     (0.92, 0.91, 0.89, 0.89, 0.63, 0.49)])[0]
+    tai = aggregate([[TuningResult("tai_score", 0.4, D2D, {100: s})] for s in
+                     (0.494, 0.902, 0.701, 0.920, 0.882, 0.885)])[0]
+    # The real archive numbers: TAI wins on only some pairs, so it does not
+    # consistently beat the static baseline.
+    assert not beats_on_every_pair(tai, inf)
+    assert not beats_on_every_pair(inf, tai)

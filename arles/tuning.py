@@ -139,21 +139,32 @@ def aggregate(per_pair_results: Sequence[Sequence[TuningResult]]) -> List[Tuning
     if not per_pair_results:
         return []
 
-    buckets: Dict[Tuple[str, float, timedelta], List[TuningResult]] = defaultdict(list)
+    # NaN never compares equal to itself, so a NaN alpha silently gives every row its
+    # own bucket. That is exactly what happened: the static baselines carry alpha=NaN,
+    # so a 6-pair run reported influence_score twelve times instead of averaging it
+    # twice, and the paired comparison then zipped a 6-tuple against a 1-tuple and
+    # truncated to one. Key on a hashable, self-equal sentinel instead.
+    def key(r: TuningResult):
+        alpha = "static" if r.alpha != r.alpha else r.alpha  # NaN check
+        return (r.metric, alpha, r.delta)
+
+    buckets: Dict[Tuple[str, object, timedelta], List[TuningResult]] = defaultdict(list)
     for pair in per_pair_results:
         for r in pair:
-            buckets[(r.metric, r.alpha, r.delta)].append(r)
+            buckets[key(r)].append(r)
 
     out: List[TuningResult] = []
-    for (metric, alpha, delta), rows in buckets.items():
+    for rows in buckets.values():
         ks = sorted(rows[0].ndcg)
         mean = {k: float(np.mean([r.ndcg[k] for r in rows])) for k in ks}
         std = {k: float(np.std([r.ndcg[k] for r in rows])) for k in ks}
         out.append(
             TuningResult(
-                metric=metric,
-                alpha=alpha,
-                delta=delta,
+                # Take metric/alpha/delta from the row, not the key: the key's alpha is
+                # a sentinel for the NaN of a static baseline, not a real value.
+                metric=rows[0].metric,
+                alpha=rows[0].alpha,
+                delta=rows[0].delta,
                 ndcg=mean,
                 ndcg_std=std,
                 n_pairs=len(rows),
@@ -396,7 +407,7 @@ def format_grid(
     if n_pairs > 1:
         header += f"  (mean of {n_pairs} window pairs)"
     out = [header, ""]
-    out.append("  delta \\ alpha  " + "".join(f"{a:>8.1f}" for a in alphas))
+    out.append("  delta \\ alpha  " + "".join(f"{a:>8.2f}" for a in alphas))
     for d in deltas:
         cells = []
         for a in alphas:
@@ -416,16 +427,18 @@ def format_grid(
         f"nDCG@100={best.score:.4f}"
         + (f" +/- {best.std:.4f} across pairs" if n_pairs > 1 else "")
     )
-    out.append(
-        f"  plateau: {len(near)}/{len(rows)} settings within {tolerance:.3f} nDCG "
-        f"of the best (marked + above)"
+    criterion = (
+        "not beaten by the best on every window pair"
+        if (best.per_pair and len(best.per_pair) > 1)
+        else f"within {tolerance:.3f} nDCG of the best"
     )
+    out.append(f"  plateau: {len(near)}/{len(rows)} settings {criterion} (marked + above)")
     if len(near) > max(3, len(rows) // 10):
         d_lo, d_hi = min(r.delta for r in near), max(r.delta for r in near)
         a_lo, a_hi = min(r.alpha for r in near), max(r.alpha for r in near)
         out.append(
             f"  => the surface is FLAT: delta {_fmt_delta(d_lo)}..{_fmt_delta(d_hi)} "
-            f"and alpha {a_lo:.1f}..{a_hi:.1f} all perform within {tolerance:.3f}."
+            f"and alpha {a_lo:.2f}..{a_hi:.2f} are all indistinguishable from the best."
         )
         out.append(
             "     Report the region and the chosen value, not a bare argmax: a re-run "

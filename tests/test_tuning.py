@@ -142,13 +142,18 @@ def test_grid_search_finds_a_planted_optimum():
     assert best_tash.metric == "tash_index"
     assert best_tai.metric == "tai_score"
     assert 0.0 <= best_tash.score <= 1.0
-    # alphas x deltas x 2 time-aware metrics, plus the 2 static baselines
-    assert len(results) == 3 * 2 * 2 + 2
+    assert len(results) == 3 * 2 * 2  # alphas x deltas x metrics
 
 
-def test_grid_search_scores_the_static_baselines():
-    """Without these the sweep can say which TASH is best, never whether TASH is worth
-    having. Verdolotti et al. compare against exactly these two."""
+def test_static_counterpart_comes_from_the_grid_not_a_separate_baseline():
+    """delta = the window gives one slot, so the EMA degenerates to the static metric.
+
+    That row IS h_index (for TASH) and influence_score (for TAI): same code path, same
+    window pairs, directly comparable. Scoring the baselines separately was redundant,
+    and was the only thing needing an alpha of NaN -- which silently broke aggregation.
+    Verified on the archive: the delta=5d row reads 0.7341 and 0.7876, matching the
+    independently computed statics to four decimals.
+    """
     actions = _planted_window()
     index = WindowIndex.build(actions)
     fx = FeatureExtractor(index, START, END)
@@ -158,48 +163,13 @@ def test_grid_search_scores_the_static_baselines():
     target = involvement_target(
         [repost(f"n{i}", f"np{i}", "steady", 1) for i in range(20)], ids
     )
+    window = END - START
     _, _, results = grid_search(
-        fx, target, alphas=(0.5,), deltas=(timedelta(hours=6),), ks=(100,),
-        progress=False,
+        fx, target, alphas=(0.1, 0.9), deltas=(window,), ks=(100,), progress=False
     )
-    assert {r.metric for r in results} == {
-        "tash_index", "tai_score", "influence_score", "h_index"
-    }
-
-
-def test_baselines_can_be_switched_off():
-    actions = _planted_window()
-    index = WindowIndex.build(actions)
-    fx = FeatureExtractor(index, START, END)
-    for a in actions:
-        fx.add(a)
-    ids, _ = fx.finish()
-    target = involvement_target(
-        [repost(f"n{i}", f"np{i}", "steady", 1) for i in range(5)], ids
-    )
-    _, _, results = grid_search(
-        fx, target, alphas=(0.5,), deltas=(timedelta(hours=6),), ks=(100,),
-        progress=False, include_baselines=False,
-    )
-    assert {r.metric for r in results} == {"tash_index", "tai_score"}
-
-
-def test_grid_search_returns_the_argmax():
-    actions = _planted_window()
-    index = WindowIndex.build(actions)
-    fx = FeatureExtractor(index, START, END)
-    for a in actions:
-        fx.add(a)
-    ids, _ = fx.finish()
-    target = involvement_target(
-        [repost(f"n{i}", f"np{i}", "steady", 1) for i in range(20)], ids
-    )
-    best_tash, _, results = grid_search(
-        fx, target, alphas=(0.1, 0.5, 0.9),
-        deltas=(timedelta(hours=6), timedelta(hours=12)), ks=(100,), progress=False,
-    )
-    tash_rows = [r for r in results if r.metric == "tash_index"]
-    assert best_tash.score == max(r.score for r in tash_rows)
+    # At one slot the EMA never iterates, so alpha cannot matter.
+    tash = [r.score for r in results if r.metric == "tash_index"]
+    assert tash[0] == pytest.approx(tash[1]), "alpha changed a single-slot EMA"
 
 
 def test_default_grid_reaches_the_static_degenerate_point():

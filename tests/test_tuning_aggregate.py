@@ -194,3 +194,61 @@ def test_paired_comparison_works_against_an_aggregated_baseline():
     # consistently beat the static baseline.
     assert not beats_on_every_pair(tai, inf)
     assert not beats_on_every_pair(inf, tai)
+
+
+# ------------------------------------------- paired comparison with magnitudes
+
+
+def _res(metric, per_pair, alpha=0.5, delta=D1H):
+    import numpy as np
+    return TuningResult(metric=metric, alpha=alpha, delta=delta,
+                        ndcg={100: float(np.mean(per_pair))},
+                        ndcg_std={100: float(np.std(per_pair))},
+                        n_pairs=len(per_pair), per_pair=tuple(per_pair))
+
+
+def test_paired_test_uses_magnitude_not_just_sign():
+    """Why the sign test was replaced.
+
+    A setting that wins by +0.02 on five pairs and loses by -0.001 on one is plainly
+    better, but scores 5/6 and the old unanimity rule called it 'not significant'.
+    """
+    from arles.tuning import compare_paired
+
+    a = _res("tash_index", [0.52, 0.52, 0.52, 0.52, 0.52, 0.499])
+    b = _res("h_index",    [0.50, 0.50, 0.50, 0.50, 0.50, 0.500])
+    cmp = compare_paired(a, b)
+    assert cmp.wins == 5                      # the old rule would reject on this alone
+    assert cmp.mean_diff > 0
+    assert not beats_on_every_pair(a, b)      # sign test: fails
+    assert cmp.p_value < 0.10                 # magnitude test: nearly there at n=6
+
+
+def test_paired_test_reports_effect_size_and_direction():
+    from arles.tuning import compare_paired
+
+    a = _res("tai_score", [0.80, 0.81, 0.79, 0.82, 0.80, 0.81])
+    b = _res("influence_score", [0.79, 0.80, 0.78, 0.81, 0.79, 0.80])
+    cmp = compare_paired(a, b)
+    assert cmp.mean_diff == pytest.approx(0.01, abs=1e-6)
+    assert cmp.wins == 6
+    assert "better" in cmp.describe()
+    assert cmp.significant                    # consistent +0.01 clears p=0.031
+
+
+def test_paired_test_calls_noise_insignificant():
+    from arles.tuning import compare_paired
+
+    a = _res("tash_index", [0.52, 0.47, 0.51, 0.48, 0.53, 0.49])
+    b = _res("h_index",    [0.50, 0.50, 0.50, 0.50, 0.50, 0.50])
+    cmp = compare_paired(a, b)
+    assert not cmp.significant
+
+
+def test_paired_test_needs_matching_pair_counts():
+    """The shape bug: zipping a 6-tuple against a 1-tuple silently truncated to 1."""
+    from arles.tuning import compare_paired
+
+    a = _res("tash_index", [0.5] * 6)
+    b = _res("h_index", [0.4])
+    assert compare_paired(a, b) is None

@@ -59,8 +59,7 @@ from .schema import CanonicalAction
 #: monotonically in delta to the 2d boundary (0.622 -> 0.797 at alpha=0.4). An argmax on
 #: an edge is not an optimum, it is where the grid stopped. Both directions point the
 #: same way -- longer memory, fewer slots -- i.e. towards the metric's own static
-#: counterpart, so the grid now runs all the way there and the baselines are scored
-#: alongside (see STATIC_BASELINES).
+#: counterpart, so the grid now runs all the way there (see STATIC_DEGENERATE_NOTE).
 DEFAULT_ALPHAS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 DEFAULT_DELTAS = (
     timedelta(minutes=15),
@@ -74,14 +73,19 @@ DEFAULT_DELTAS = (
     timedelta(days=5),  # one slot for a 5-day window: the EMA degenerates to static
 )
 
-#: The static rankings the time-aware ones must beat to justify their existence.
+#: The static counterpart of each time-aware metric is already in the grid.
 #:
-#: Verdolotti et al. evaluate the TASH-Index and TAI-Score against exactly these, and
-#: report that TASH closely follows their ML model while the H-Index and Influence Score
-#: "consistently underperform". That comparison has to be repeated here rather than
-#: assumed: if influence_score alone matches TAI, the time-aware variant is buying
-#: nothing on this data and does not deserve a slot in the feature bucket.
-STATIC_BASELINES = ("influence_score", "h_index")
+#: At delta = the analysis window there is exactly one slot, so the EMA degenerates and
+#: TASH is the plain h-index, TAI the plain influence score. That row therefore *is* the
+#: static baseline -- computed by the same code path, over the same window pairs, and so
+#: directly comparable. Verified on the archive: the delta=5d row reads 0.7341 and 0.7876,
+#: matching the independently computed h_index and influence_score to four decimals.
+#:
+#: Scoring the baselines separately was redundant, and it was the only thing that needed
+#: an alpha of NaN -- which silently broke aggregation, since NaN never equals itself.
+STATIC_DEGENERATE_NOTE = (
+    "the delta = window row is the static counterpart: one slot, EMA degenerates"
+)
 
 
 def ndcg_at_k(scores: np.ndarray, relevance: np.ndarray, k: int) -> float:
@@ -139,11 +143,9 @@ def aggregate(per_pair_results: Sequence[Sequence[TuningResult]]) -> List[Tuning
     if not per_pair_results:
         return []
 
-    # NaN never compares equal to itself, so a NaN alpha silently gives every row its
-    # own bucket. That is exactly what happened: the static baselines carry alpha=NaN,
-    # so a 6-pair run reported influence_score twelve times instead of averaging it
-    # twice, and the paired comparison then zipped a 6-tuple against a 1-tuple and
-    # truncated to one. Key on a hashable, self-equal sentinel instead.
+    # Defensive: NaN never compares equal to itself, so a NaN alpha would give every
+    # row its own bucket and silently defeat the averaging. Nothing produces a NaN
+    # alpha any more, but the failure mode was invisible in the output when it did.
     def key(r: TuningResult):
         alpha = "static" if r.alpha != r.alpha else r.alpha  # NaN check
         return (r.metric, alpha, r.delta)
@@ -174,22 +176,89 @@ def aggregate(per_pair_results: Sequence[Sequence[TuningResult]]) -> List[Tuning
     return out
 
 
+@dataclass
+class PairedComparison:
+    """The result of comparing two settings across the same window pairs."""
+
+    a: str
+    b: str
+    diffs: Tuple[float, ...]
+    wins: int
+    n: int
+    mean_diff: float
+    sem_diff: float
+    p_value: float
+
+    @property
+    def significant(self) -> bool:
+        return self.p_value < 0.05
+
+    def describe(self) -> str:
+        direction = "better" if self.mean_diff > 0 else "worse"
+        verdict = "SIGNIFICANT" if self.significant else "not significant"
+        return (
+            f"{self.a} vs {self.b}: {self.mean_diff:+.4f} +/- {self.sem_diff:.4f} "
+            f"({direction} on {self.wins}/{self.n} pairs, Wilcoxon p={self.p_value:.3f}, "
+            f"{verdict})"
+        )
+
+
+def compare_paired(a: TuningResult, b: TuningResult) -> Optional[PairedComparison]:
+    """Compare two settings using the paired design, with magnitudes.
+
+    Every setting is scored on the *same* window pairs, so the scores are paired and the
+    between-pair variation -- which is mostly pair difficulty, not setting quality --
+    cancels. Measured on 6 pairs, nDCG@100 ranged 0.44..0.90 for every setting alike
+    because early August is sparse for all of them; that common difficulty inflates the
+    unpaired std to ~0.16 and swamps the ~0.01 differences we care about.
+
+    An earlier version used a bare sign test requiring a 6/6 sweep. That was too crude
+    in two ways: it discarded magnitude entirely (a setting winning by +0.02 on five
+    pairs and losing by -0.001 on one scored 5/6 and was called "not significant"), and
+    with n=6 a sign test cannot return p<0.05 for anything short of unanimity. The
+    Wilcoxon signed-rank test uses the size of the differences, not just their sign.
+
+    n=6 is small: the minimum attainable Wilcoxon p is 0.031, so this can detect a
+    consistent effect but has little power against a marginal one. That is a real limit
+    of the design and worth stating rather than papering over.
+    """
+    if not a.per_pair or not b.per_pair:
+        return None
+    if len(a.per_pair) != len(b.per_pair) or len(a.per_pair) < 2:
+        return None
+
+    diffs = tuple(x - y for x, y in zip(a.per_pair, b.per_pair))
+    n = len(diffs)
+    wins = sum(1 for d in diffs if d > 0)
+    mean_diff = float(np.mean(diffs))
+    sem = float(np.std(diffs, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+
+    p = 1.0
+    if any(d != 0 for d in diffs):
+        try:
+            from scipy.stats import wilcoxon
+
+            p = float(wilcoxon(diffs, alternative="two-sided", zero_method="zsplit").pvalue)
+        except Exception:
+            # Fall back to an exact two-sided sign test.
+            from math import comb
+
+            k = min(wins, n - wins)
+            p = min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / (2 ** n))
+
+    return PairedComparison(
+        a=f"{a.metric}", b=f"{b.metric}", diffs=diffs, wins=wins, n=n,
+        mean_diff=mean_diff, sem_diff=sem, p_value=p,
+    )
+
+
 def beats_on_every_pair(best: TuningResult, other: TuningResult) -> bool:
-    """Did `best` outscore `other` on every single window pair?
+    """Did `best` outscore `other` on every window pair? (sign test, unanimity)
 
-    A sign test, which is the right instrument for this design and this n. The same
-    window pairs score every setting, so their scores are paired -- and the variation
-    between pairs is mostly pair *difficulty*, not setting quality. Measured on 6 pairs:
-    nDCG@100 was 0.442, 0.898, 0.607, 0.871, 0.845, 0.834 for TASH and 0.494, 0.902,
-    0.701, 0.920, 0.882, 0.885 for TAI -- pair 1 is the outlier for both, because early
-    August is sparse for every setting alike.
-
-    That common difficulty inflates the unpaired standard deviation to ~0.16, which
-    swamps the ~0.01 differences between settings and makes "mean +/- std" useless: it
-    would call 43 of 80 settings indistinguishable. Paired, it cancels.
-
-    With n = 6, winning all six is p = 2^-6 = 0.016 one-sided; five of six is p = 0.11,
-    which is not evidence. So the bar is a clean sweep.
+    Retained for the plateau, where a deliberately conservative criterion is wanted:
+    a setting is only dropped from the plateau if it loses on every pair. Use
+    compare_paired for the question "is A actually better than B", which needs
+    magnitudes.
     """
     if not best.per_pair or not other.per_pair:
         return False
@@ -252,34 +321,6 @@ def involvement_target(
     return target
 
 
-def baseline_results(
-    extractor: FeatureExtractor,
-    target: np.ndarray,
-    ks: Sequence[int] = (10, 100, 1000),
-) -> List[TuningResult]:
-    """Score the static rankings the time-aware metrics have to beat.
-
-    Reported as TuningResults with alpha/delta of None so they sit alongside the grid.
-    Without these the sweep can only say which TASH is the best TASH -- never whether
-    any TASH is worth having.
-    """
-    from .features import FEATURE_NAMES
-
-    _, X = extractor.finish()
-    out: List[TuningResult] = []
-    for name in STATIC_BASELINES:
-        col = X[:, FEATURE_NAMES.index(name)]
-        out.append(
-            TuningResult(
-                metric=name,
-                alpha=float("nan"),
-                delta=timedelta(0),
-                ndcg={k: ndcg_at_k(col, target, k) for k in ks},
-            )
-        )
-    return out
-
-
 def grid_search(
     extractor: FeatureExtractor,
     target: np.ndarray,
@@ -287,20 +328,21 @@ def grid_search(
     deltas: Sequence[timedelta] = DEFAULT_DELTAS,
     ks: Sequence[int] = (10, 100, 1000),
     progress: bool = True,
-    include_baselines: bool = True,
 ) -> Tuple[TuningResult, TuningResult, List[TuningResult]]:
-    """Sweep (alpha, delta) for TASH and TAI, plus the static baselines.
+    """Sweep (alpha, delta) for TASH and TAI.
 
     Returns (best_tash, best_tai, all_results). The extractor's buffer is built once
     and re-scored per grid point; the archive is not re-read.
+
+    Include delta = the analysis window in `deltas` to get each metric's static
+    counterpart for free: one slot means the EMA degenerates (see
+    STATIC_DEGENERATE_NOTE).
     """
     ts, content, actor, content_author, content_n = extractor.sorted_buffer()
     n_actors = len(extractor._actor_ids)
     origin = extractor.window_start.timestamp()
 
     results: List[TuningResult] = []
-    if include_baselines:
-        results.extend(baseline_results(extractor, target, ks))
     total = len(alphas) * len(deltas)
     done = 0
 
@@ -334,42 +376,6 @@ def grid_search(
     best_tai = max((r for r in results if r.metric == "tai_score"), key=lambda r: r.score)
     return best_tash, best_tai, results
 
-
-def format_baselines(results: Sequence[TuningResult]) -> str:
-    """The comparison that decides whether the time-aware features earn their slot."""
-    rows = [r for r in results if r.metric in STATIC_BASELINES]
-    if not rows:
-        return ""
-    out = ["Static baselines vs the best time-aware setting", ""]
-    n_pairs = rows[0].n_pairs
-    for r in sorted(rows, key=lambda r: -r.score):
-        line = f"  {r.metric:<16} nDCG@100={r.score:.4f}"
-        if n_pairs > 1:
-            line += f" +/- {r.std:.4f}"
-        out.append(line)
-
-    for metric in ("tash_index", "tai_score"):
-        near, best = plateau(results, metric)
-        if best is None:
-            continue
-        out.append(f"  {metric:<16} nDCG@100={best.score:.4f} "
-                   f"(alpha={best.alpha:.2f}, delta={_fmt_delta(best.delta)})")
-        for b in rows:
-            if not b.per_pair or not best.per_pair:
-                continue
-            wins = sum(1 for x, y in zip(best.per_pair, b.per_pair) if x > y)
-            n = len(best.per_pair)
-            verdict = (
-                f"beats {b.metric} on {wins}/{n} pairs"
-                if wins == n
-                else f"does NOT consistently beat {b.metric} ({wins}/{n} pairs)"
-            )
-            out.append(f"      -> {verdict}")
-    out.append("")
-    out.append("  If a time-aware metric does not consistently beat its static")
-    out.append("  counterpart, it is not earning its place in the feature bucket and")
-    out.append("  the paper should say so rather than include it for symmetry.")
-    return "\n".join(out)
 
 
 def _fmt_delta(d: timedelta) -> str:

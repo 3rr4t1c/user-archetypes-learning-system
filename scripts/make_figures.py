@@ -3,12 +3,45 @@
 
 What it produces
 ----------------
-    archetype_evolution_e1_e2.pdf   the figure: mean archetype score per 5-day window
+    fig_mean_score_per_window.pdf   the published figure: mean archetype score per window
+    fig_prevalence.pdf              accounts above a fixed bar: count, and rate per 100k
+    fig_threshold_sweep.pdf         the same at four bars, to show the bar is not the finding
+    fig_head_intensity.pdf          p99/p99.9 per window -- no denominator
+    fig_concentration.pdf           Gini and top-1% mass share -- no threshold either
+    fig_prepost_prevalence.pdf      pre / post / late per event, absolute and fold change
+    fig_archetype_space.pdf         pairwise scatter of the three axes (talks)
+    fig_cohorts.pdf                 --cohorts only: incumbents vs newcomers
     archetype_fit.json              the frozen embedding -- the ruler
     loadings.txt                    what each axis is actually made of
-    windows.csv                     every number behind the figure, N included
-    archetype_space.pdf             pairwise scatter of the three axes (talks)
-    cohorts_e1_e2.pdf               --cohorts only: incumbents vs newcomers
+    windows.csv                     the numbers behind the mean figure, N included
+    features.csv                    per-window means of the twelve raw features
+    prevalence.csv                  every head statistic, per window per axis
+
+Why the mean figure is not enough
+---------------------------------
+The published figure plots a mean over every account in the window. None of the three
+archetypes describes a typical account, so that mean is mostly a statement about the
+~99% who are no archetype at all. Measured on the archive, `median_superspreader` is
+0.0000 in all fourteen E1/E2 windows and the mean never leaves [0.021, 0.037]: a
+statistic that cannot move cannot support a claim, and a flat line in it is not evidence
+of a flat phenomenon.
+
+The other figures measure the head instead: how many accounts clear a fixed bar
+(prevalence), how extreme the extremes are (intensity), and how unequally the axis is
+spread (concentration). They fail differently from each other, which is the point.
+
+The bar is common to all three axes
+-----------------------------------
+The three archetypes are rare at three *different* scales -- amplifiers outnumber
+super-spreaders by an order of magnitude, with coordinated accounts in between -- and the
+figures have to preserve that, because it is the thing that makes their counts
+incomparable and their fold changes the only fair comparison.
+
+So `--bar` is one score applied to all three axes. It is emphatically NOT a per-axis
+quantile: the top q of each axis puts (1-q) of the population above every axis's bar by
+construction, which reports the three archetypes as equally common. On the real
+pre-event window that gave 194 / 198 / 304 accounts; the common bar at 0.5 gives
+538 / 3,137 / 616. See arles.prevalence for the argument in full.
 
 One ruler for every window
 --------------------------
@@ -45,6 +78,11 @@ window's buffers at a time.
 
 Usage
 -----
+    # quick look at the figures: two cached windows of one event, ~1 min
+    python scripts/make_figures.py <archive> --out figures_preview/ \
+        --events E1 --max-windows 2
+
+    # the study
     python scripts/make_figures.py /Volumes/Uniform/bluesky_full --out figures/
     python scripts/make_figures.py <archive> --out figures/ --cohorts
 """
@@ -66,18 +104,44 @@ from arles.actions import MalformedActionError, parse_timestamp  # noqa: E402
 from arles.embedding import AXES, fit_pooled  # noqa: E402
 from arles.features import FEATURE_NAMES, FeatureExtractor, WindowIndex  # noqa: E402
 from arles.mappers.bluesky import map_row  # noqa: E402
+from arles.prevalence import (  # noqa: E402
+    COMMON_BAR,
+    SWEEP_BARS,
+    fold_change,
+    head_stats,
+)
 from arles.streaming import build_index, discover_files, iter_window  # noqa: E402
 
-#: The two events Figure 8 shows, and the window each panel starts from.
+#: The paper's four migration events, and the window each panel starts from.
 #:
-#: E1 spans Aug 25 -> Sep 24 and E2 Oct 12 -> Nov 11: seven consecutive 5-day windows
-#: each, the first being the pre-event window. Dates are the paper's.
+#: Each event gets seven consecutive 5-day windows, the first being the pre-event window,
+#: so the event date always falls just inside window 1 and the panel shows one window of
+#: "before". Dates are the paper's (Sec. 4.1).
+#:
+#: E4 is short. The archive ends 2025-01-28, so only five of E4's seven windows are
+#: complete (Jan 1 -> Jan 26); `n_windows` caps it rather than plotting a partial window
+#: as though it were a whole one, which would read as a collapse in every count.
+#:
+#: E2 and E3 overlap in time (E2 runs to Nov 16, E3 from Oct 31), so the pooled fit sees
+#: Oct 31 -> Nov 16 twice. That slightly overweights those days in the ruler and in the
+#: pooled threshold; it does not affect any single window's features, which are built
+#: from that window's actions alone.
 EVENTS = [
-    {"id": "E1", "name": "X/Twitter ban in Brazil", "start": "2024-08-25", "event": "2024-08-30"},
-    {"id": "E2", "name": "X/Twitter Terms & Privacy update", "start": "2024-10-12", "event": "2024-10-17"},
+    {"id": "E1", "name": "X/Twitter ban in Brazil",
+     "start": "2024-08-25", "event": "2024-08-30", "n_windows": 7},
+    {"id": "E2", "name": "X/Twitter Terms & Privacy update",
+     "start": "2024-10-12", "event": "2024-10-17", "n_windows": 7},
+    {"id": "E3", "name": "US Presidential election",
+     "start": "2024-10-31", "event": "2024-11-05", "n_windows": 7},
+    {"id": "E4", "name": "Broad social-media ToS updates",
+     "start": "2025-01-01", "event": "2025-01-06", "n_windows": 5},
 ]
 N_WINDOWS = 7
 WINDOW_DAYS = 5.0
+
+#: Where the archive stops. Any window ending after this is incomplete by definition and
+#: is not plotted -- see EVENTS["n_windows"] for E4.
+ARCHIVE_END = "2025-01-28"
 
 AXIS_LABEL = {
     "superspreader": "Super-Spreader",
@@ -166,10 +230,11 @@ def collect(files, spans, cache_dir):
     out = []
     for ev in EVENTS:
         first = _date(ev["start"])
-        for w in range(N_WINDOWS):
+        n = ev.get("n_windows", N_WINDOWS)
+        for w in range(n):
             start = first + timedelta(days=WINDOW_DAYS * w)
             end = start + timedelta(days=WINDOW_DAYS)
-            print(f"\n  {ev['id']} window {w + 1}/{N_WINDOWS}: {start.date()} -> {end.date()}")
+            print(f"\n  {ev['id']} window {w + 1}/{n}: {start.date()} -> {end.date()}")
             fx, index = load_window(files, spans, start, end, cache_dir)
             ids, X = fx.finish()
             _, conf = fx.confidence()
@@ -221,6 +286,25 @@ def write_features_csv(windows, path):
                      for i in range(len(FEATURE_NAMES))]
             w.writerow([win["event"], win["w"] + 1, win["start"].date(),
                         len(win["ids"])] + means)
+
+
+def write_prevalence_csv(windows, Zs, bar, path):
+    """Every head statistic, per window per axis. The numbers behind the new figures."""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["event", "window", "start", "axis", "threshold", "n_users", "count",
+                    "rate_per_100k", "p99", "p999", "pmax", "gini", "top1pct_share",
+                    "anchor_feature", "anchor_median"])
+        for win, Z in zip(windows, Zs):
+            if not len(win["ids"]):
+                continue
+            for a, axis in enumerate(AXES):
+                h = head_stats(Z[:, a], bar, axis, X=win["X"])
+                w.writerow([win["event"], win["w"] + 1, win["start"].date(), axis,
+                            f"{h.threshold:.6f}", h.n_users, h.count,
+                            f"{h.rate_per_100k:.3f}", f"{h.p99:.4f}", f"{h.p999:.4f}",
+                            f"{h.pmax:.4f}", f"{h.gini:.4f}", f"{h.top1pct_share:.4f}",
+                            h.anchor_feature, f"{h.anchor_median:.1f}"])
 
 
 def _panels(windows):
@@ -290,6 +374,322 @@ def plot_evolution(windows, Zs, path):
         axes[0].legend(loc="lower center", bbox_to_anchor=(0.5, 1.10), ncol=3,
                        frameon=False, handlelength=2.4, columnspacing=2.5)
         fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def _event_windows(windows, ev_id):
+    return [i for i, w in enumerate(windows)
+            if w["event"] == ev_id and len(w["ids"])]
+
+
+def _mpl():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _date_ticks(ax, xs, rotate=False):
+    """One tick per window, on the point, labelled '25 Aug'.
+
+    matplotlib's automatic date locator picks its own interval (6 days against 5-day
+    windows), so ticks land between points and label nothing in particular.
+
+    `rotate` is not cosmetic: seven "25 Aug" labels fit across the 7.2-inch single-column
+    figure and do not fit across a 4.3-inch half of a two-column one, where they render
+    as "25 Aug30 Aug04 Sep".
+    """
+    ax.set_xticks(xs)
+    ax.set_xticklabels([d.strftime("%d %b") for d in xs],
+                       rotation=45 if rotate else 0,
+                       ha="right" if rotate else "center")
+    ax.set_xlim(xs[0] - timedelta(days=1.2), xs[-1] + timedelta(days=1.2))
+    ax.set_axisbelow(True)
+
+
+def plot_prevalence(windows, Zs, bar, path):
+    """How many accounts clear a fixed bar, and what share of the platform they are.
+
+    The figure the mean-over-everyone plot cannot be. Left column: absolute head count.
+    Right column: the same as a rate per 100,000 accounts. Both, deliberately -- the
+    population tripled at E1 and at E2, so a count that triples means the rate did not
+    move, and a count that holds means the rate fell 3x. Either line alone lets a reader
+    draw whichever conclusion they arrived with.
+
+    Log y throughout: the rates live between ~1 and ~1000 per 100k, and a linear axis
+    would render the super-spreader series as a line along zero -- the same failure as
+    the mean, one step later.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(len(events), 2, figsize=(9.6, 2.5 * len(events)),
+                                 squeeze=False)
+        for row, ev in enumerate(events):
+            idx = _event_windows(windows, ev["id"])
+            xs = [windows[i]["start"] for i in idx]
+            for col, (what, label) in enumerate(
+                [("count", "Accounts above bar"), ("rate", "per 100k accounts")]
+            ):
+                ax = axes[row, col]
+                for a, axis in enumerate(AXES):
+                    ys = []
+                    for i in idx:
+                        h = head_stats(Zs[i][:, a], bar, axis)
+                        v = h.count if what == "count" else h.rate_per_100k
+                        ys.append(v if v > 0 else np.nan)  # log axis: 0 has no place
+                    ax.plot(xs, ys, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
+                            label=AXIS_LABEL[axis], linewidth=1.8, markersize=5,
+                            markeredgewidth=0, zorder=3)
+                ax.set_yscale("log")
+                _date_ticks(ax, xs, rotate=True)
+                ax.axvline(_date(ev["event"]), color="#d62728", linestyle="--",
+                           linewidth=1.3, zorder=2)
+                # The row is already labelled with the event id, so the dashed line
+                # needs no annotation repeating it.
+                ax.set_ylabel(f"{ev['id']}\n{label}" if col == 0 else label)
+
+        axes[0, 0].legend(loc="lower left", bbox_to_anchor=(0.0, 1.04), ncol=3,
+                          frameon=False, handlelength=2.2, columnspacing=2.0)
+        fig.suptitle(f"Accounts scoring >= {bar:g} on each axis", y=1.005, fontsize=10)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_threshold_sweep(windows, Zs, path):
+    """Prevalence at five bars, so the reader can see the bar is not the finding.
+
+    Any threshold invites "why that one?", and the honest answer is not a better
+    threshold -- it is that the answer does not depend on it. One column per archetype,
+    one line per bar, each normalised to its own pre-event window so five series
+    spanning orders of magnitude can share an axis.
+
+    Normalising per series is also what makes this figure legitimate across archetypes:
+    amplifiers outnumber super-spreaders by an order of magnitude, so plotting their
+    absolute rates together would show one flat line at the bottom and nothing else. The
+    absolute scale is fig_prevalence's job; this figure's job is the shape of the change.
+
+    If the lines move together, the shape is the data's. If they cross, it is the bar's,
+    and nothing at any single bar should be reported.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(len(events), len(AXES),
+                                 figsize=(3.4 * len(AXES), 2.4 * len(events)),
+                                 squeeze=False, sharey="row")
+        shades = plt.cm.viridis(np.linspace(0.15, 0.85, len(SWEEP_BARS)))
+        for row, ev in enumerate(events):
+            idx = _event_windows(windows, ev["id"])
+            xs = [windows[i]["start"] for i in idx]
+            for col, axis in enumerate(AXES):
+                ax = axes[row, col]
+                a = AXES.index(axis)
+                for k, theta in enumerate(SWEEP_BARS):
+                    rates = [head_stats(Zs[i][:, a], theta, axis).rate_per_100k
+                             for i in idx]
+                    ys = [fold_change(rates[0], r) for r in rates]
+                    ax.plot(xs, ys, marker="o", markersize=3.5, linewidth=1.4,
+                            color=shades[k], markeredgewidth=0,
+                            label=f"θ = {theta:g}", zorder=3)
+                ax.axhline(1.0, color="#888888", linewidth=0.9, zorder=1)
+                ax.axvline(_date(ev["event"]), color="#d62728", linestyle="--",
+                           linewidth=1.2, zorder=2)
+                _date_ticks(ax, xs, rotate=True)
+                if row == 0:
+                    ax.set_title(AXIS_LABEL[axis], fontsize=10)
+                if col == 0:
+                    ax.set_ylabel(f"{ev['id']}\nprevalence / pre-event")
+
+        axes[0, -1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False,
+                           fontsize=8, title="bar", title_fontsize=8)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_head_intensity(windows, Zs, path):
+    """How extreme the extremes are: the p99.9 of each axis per window.
+
+    The one view here with no denominator at all. Prevalence asks how many accounts
+    cleared a bar, and its answer moves when the population moves; this asks how high
+    the top of the distribution reached, and 600,000 uninvolved accounts cannot dilute
+    it. If an event brought more extreme accounts rather than merely more accounts,
+    this is where it shows.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(len(events), 1, figsize=(7.2, 2.4 * len(events)),
+                                 squeeze=False, sharey=True)
+        for row, ev in enumerate(events):
+            ax = axes[row, 0]
+            idx = _event_windows(windows, ev["id"])
+            xs = [windows[i]["start"] for i in idx]
+            for a, axis in enumerate(AXES):
+                p999 = [head_stats(Zs[i][:, a], 0.0, axis).p999 for i in idx]
+                p99 = [head_stats(Zs[i][:, a], 0.0, axis).p99 for i in idx]
+                ax.plot(xs, p999, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
+                        label=f"{AXIS_LABEL[axis]} p99.9", linewidth=1.8, markersize=5,
+                        markeredgewidth=0, zorder=3)
+                ax.plot(xs, p99, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
+                        label=f"{AXIS_LABEL[axis]} p99", linewidth=1.0, markersize=3,
+                        linestyle=":", alpha=0.75, markeredgewidth=0, zorder=3)
+            _date_ticks(ax, xs)
+            ax.axvline(_date(ev["event"]), color="#d62728", linestyle="--",
+                       linewidth=1.3, zorder=2)
+            ax.set_ylabel(f"{ev['id']}\nArchetype score")
+
+        axes[0, 0].legend(loc="lower center", bbox_to_anchor=(0.5, 1.06), ncol=3,
+                          frameon=False, fontsize=8, columnspacing=1.6)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_concentration(windows, Zs, path):
+    """Gini and the top-1% mass share: the same question with no threshold at all.
+
+    Prevalence and intensity can both be argued with by arguing about where the bar is.
+    Concentration cannot -- it reads the whole distribution. If diffusion power
+    concentrated into fewer hands after an event, Gini rises and the top 1% hold more of
+    the axis, and neither statement depends on a choice anyone made.
+
+    This is the most defensible of the four figures and the least specific: it says the
+    shape changed, not who changed it.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(len(events), 2, figsize=(9.6, 2.4 * len(events)),
+                                 squeeze=False, sharey="col")
+        for row, ev in enumerate(events):
+            idx = _event_windows(windows, ev["id"])
+            xs = [windows[i]["start"] for i in idx]
+            for col, (attr, label) in enumerate(
+                [("gini", "Gini"), ("top1pct_share", "Top-1% share of axis mass")]
+            ):
+                ax = axes[row, col]
+                for a, axis in enumerate(AXES):
+                    ys = [getattr(head_stats(Zs[i][:, a], 0.0, axis), attr) for i in idx]
+                    ax.plot(xs, ys, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
+                            label=AXIS_LABEL[axis], linewidth=1.8, markersize=5,
+                            markeredgewidth=0, zorder=3)
+                _date_ticks(ax, xs, rotate=True)
+                ax.axvline(_date(ev["event"]), color="#d62728", linestyle="--",
+                           linewidth=1.3, zorder=2)
+                ax.set_ylabel(f"{ev['id']}\n{label}" if col == 0 else label)
+
+        axes[0, 0].legend(loc="lower left", bbox_to_anchor=(0.0, 1.04), ncol=3,
+                          frameon=False, handlelength=2.2)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_prepost(windows, Zs, bar, path):
+    """Pre vs post per event, in the units a rare class is actually read in.
+
+    Replaces the old per-event comparison figure. Two panels:
+
+    (a) prevalence per 100k in the pre-event window, the window straight after the event,
+        and the late windows (5 onwards) -- absolute, log y, so the enormous difference
+        in how common the three archetypes are is visible rather than normalised away.
+    (b) the same as a fold change against the pre-event window, which is the number the
+        shock is actually read in: "10 became 15" is 1.5x whatever the base rate.
+
+    Panel (a) alone would show super-spreaders as a sliver next to amplifiers and invite
+    "nothing happened". Panel (b) alone would show a 1.5x next to a 1.5x and invite the
+    reader to think the two are equally consequential when one is 15 accounts and the
+    other 15,000. They are two halves of one claim.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    phases = [("pre", "Pre-event"), ("post", "Post-event"), ("late", "Late (w5+)")]
+    hatches = {"pre": "", "post": "///", "late": "..."}
+
+    def rate(idx_list, a, axis):
+        if not idx_list:
+            return float("nan")
+        return float(np.mean([head_stats(Zs[i][:, a], bar, axis).rate_per_100k
+                              for i in idx_list]))
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(2, 1, figsize=(8.6, 6.6), sharex=True)
+        width = 0.26
+        # The tick says only the event. Colour already says which archetype, and
+        # spelling it out under every bar collides the labels into unreadable mush --
+        # "Super-SpreadAmplifiCoordinated" was the first attempt.
+        ticks, labels = [], []
+        for e, ev in enumerate(events):
+            idx = _event_windows(windows, ev["id"])
+            pre, post, late = idx[:1], idx[1:2], idx[4:]
+            for a, axis in enumerate(AXES):
+                pos = e * (len(AXES) + 1) + a
+                vals = {"pre": rate(pre, a, axis), "post": rate(post, a, axis),
+                        "late": rate(late, a, axis)}
+                for k, (key, _) in enumerate(phases):
+                    v = vals[key]
+                    if not np.isfinite(v):
+                        continue
+                    axes[0].bar(pos + (k - 1) * width, max(v, 1e-3), width * 0.92,
+                                color=AXIS_COLOUR[axis], alpha=1.0 - 0.22 * k,
+                                hatch=hatches[key], edgecolor="white", linewidth=0.4,
+                                zorder=3)
+                for k, key in enumerate(["post", "late"]):
+                    fc = fold_change(vals["pre"], vals[key])
+                    if not np.isfinite(fc):
+                        continue  # 0 -> n is not a fold change; leave the slot empty
+                    axes[1].bar(pos + (k - 0.5) * width, fc, width * 0.92,
+                                color=AXIS_COLOUR[axis], alpha=1.0 - 0.22 * (k + 1),
+                                hatch=hatches[key], edgecolor="white", linewidth=0.4,
+                                zorder=3)
+            ticks.append(e * (len(AXES) + 1) + 1)  # centre of the event's group
+            labels.append(ev["id"])
+
+        axes[0].set_yscale("log")
+        axes[0].set_ylabel(f"Accounts per 100k\nscoring >= {bar:g}")
+        axes[1].axhline(1.0, color="#444444", linewidth=1.0, zorder=2)
+        axes[1].set_ylabel("Fold change vs pre-event")
+        for ax in axes:
+            ax.set_axisbelow(True)
+        axes[1].set_xticks(ticks)
+        axes[1].set_xticklabels(labels)
+
+        phase_handles = [plt.Rectangle((0, 0), 1, 1, facecolor="#777777",
+                                       alpha=1.0 - 0.22 * k, hatch=hatches[key],
+                                       edgecolor="white")
+                         for k, (key, _) in enumerate(phases)]
+        axis_handles = [plt.Rectangle((0, 0), 1, 1, facecolor=AXIS_COLOUR[a])
+                        for a in AXES]
+        # Two legends, stacked: colour says which archetype, hatch says which phase.
+        # Side by side they are six entries across one panel width and the last
+        # archetype lands on top of the first phase.
+        #
+        # fig.legend, not ax.legend: a second ax.legend() call detaches the first, and
+        # add_artist does not survive it -- the archetype legend silently vanished.
+        fig.tight_layout()
+        fig.legend(axis_handles, [AXIS_LABEL[a] for a in AXES], loc="lower center",
+                   bbox_to_anchor=(0.5, 1.05), ncol=3, frameon=False)
+        fig.legend(phase_handles, [lab for _, lab in phases], loc="lower center",
+                   bbox_to_anchor=(0.5, 1.0), ncol=3, frameon=False)
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
 
@@ -377,11 +777,37 @@ def main():
                     help="window buffer cache; '' to disable")
     ap.add_argument("--cohorts", action="store_true",
                     help="also split incumbents vs newcomers (see plot_cohorts)")
+    ap.add_argument("--bar", type=float, default=COMMON_BAR,
+                    help="score bar, common to all three axes (default %(default)s). "
+                         "Common on purpose: a per-axis quantile equalises the three "
+                         "archetypes' prevalence by construction and hides that they are "
+                         "rare at different scales. The figures sweep it anyway.")
+    ap.add_argument("--events", default="",
+                    help="comma-separated event ids to run, e.g. 'E1,E2'. Default: all "
+                         "four. E3/E4 need archive passes the E1/E2 cache cannot serve.")
+    ap.add_argument("--max-windows", type=int, default=0,
+                    help="cap the windows per event. For a quick look at the figures "
+                         "before committing to a full run; the numbers in a capped run "
+                         "are real but the pooled fit is fitted on less, so do not "
+                         "report them.")
     ap.add_argument("--no-log", action="store_true",
                     help="do not log1p the features before scaling. Only for comparison: "
                          "on raw counts one account defines the axis and the other 99.9%% "
                          "are pinned at zero.")
     args = ap.parse_args()
+
+    if args.events:
+        wanted = {e.strip().upper() for e in args.events.split(",")}
+        unknown = wanted - {e["id"] for e in EVENTS}
+        if unknown:
+            ap.error(f"unknown event id(s): {', '.join(sorted(unknown))}")
+        EVENTS[:] = [e for e in EVENTS if e["id"] in wanted]
+
+    if args.max_windows:
+        for e in EVENTS:
+            e["n_windows"] = min(e.get("n_windows", N_WINDOWS), args.max_windows)
+        print(f"PREVIEW: {args.max_windows} window(s) per event. The pooled fit and the "
+              f"bar are fitted on this subset, so the numbers are not the study's.\n")
 
     t0 = time.time()
     out = Path(args.out)
@@ -407,15 +833,31 @@ def main():
     for w in embedder.warnings():
         print(f"\n  ! {w}")
 
+    # ONE bar, common to all three axes. Not a per-axis quantile: that puts the same
+    # fraction above every axis's bar by construction and reports the three archetypes
+    # as equally common, which they are not -- see arles.prevalence.
+    bar = args.bar
+
     (out / "archetype_fit.json").write_text(embedder.to_json())
     (out / "loadings.txt").write_text(embedder.loadings_table() + "\n")
     write_windows_csv(windows, Zs, out / "windows.csv")
     write_features_csv(windows, out / "features.csv")
+    write_prevalence_csv(windows, Zs, bar, out / "prevalence.csv")
 
-    plot_evolution(windows, Zs, out / "archetype_evolution_e1_e2.pdf")
-    plot_archetype_space(windows, Zs, out / "archetype_space.pdf")
+    # The published figure: mean over every account. Kept, and named for what it is --
+    # the mean is dominated by the ~99% of accounts that are no archetype at all, which
+    # is why median_superspreader is 0.0000 in every window and why the four figures
+    # below exist.
+    plot_evolution(windows, Zs, out / "fig_mean_score_per_window.pdf")
+
+    plot_prevalence(windows, Zs, bar, out / "fig_prevalence.pdf")
+    plot_threshold_sweep(windows, Zs, out / "fig_threshold_sweep.pdf")
+    plot_head_intensity(windows, Zs, out / "fig_head_intensity.pdf")
+    plot_concentration(windows, Zs, out / "fig_concentration.pdf")
+    plot_prepost(windows, Zs, bar, out / "fig_prepost_prevalence.pdf")
+    plot_archetype_space(windows, Zs, out / "fig_archetype_space.pdf")
     if args.cohorts:
-        plot_cohorts(windows, Zs, out / "cohorts_e1_e2.pdf")
+        plot_cohorts(windows, Zs, out / "fig_cohorts.pdf")
 
     print("\n" + "=" * 72)
     print(embedder.loadings_table())

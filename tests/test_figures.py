@@ -46,10 +46,10 @@ def fake_windows(n_events=2, n_windows=7, seed=0):
 # ------------------------------------------------------------------ layout
 
 
-def test_two_events_seven_windows_each_matching_the_paper():
+def test_all_four_of_the_papers_events_are_covered():
     assert mf.N_WINDOWS == 7
     assert mf.WINDOW_DAYS == 5.0
-    assert [e["id"] for e in mf.EVENTS] == ["E1", "E2"]
+    assert [e["id"] for e in mf.EVENTS] == ["E1", "E2", "E3", "E4"]
     # E1 spans Aug 25 -> Sep 24, E2 Oct 12 -> Nov 11: the paper's axes.
     for ev, last in (("E1", "2024-09-24"), ("E2", "2024-11-11")):
         spec = next(e for e in mf.EVENTS if e["id"] == ev)
@@ -59,8 +59,14 @@ def test_two_events_seven_windows_each_matching_the_paper():
 
 
 def test_event_dates_are_the_papers():
-    assert mf._date(mf.EVENTS[0]["event"]).date().isoformat() == "2024-08-30"  # Brazil ban
-    assert mf._date(mf.EVENTS[1]["event"]).date().isoformat() == "2024-10-17"  # ToS change
+    """Sec. 4.1: the four migration events, by date."""
+    got = {e["id"]: mf._date(e["event"]).date().isoformat() for e in mf.EVENTS}
+    assert got == {
+        "E1": "2024-08-30",  # X banned in Brazil
+        "E2": "2024-10-17",  # X terms & privacy update
+        "E3": "2024-11-05",  # US presidential election
+        "E4": "2025-01-06",  # broad social-media ToS updates
+    }
 
 
 def test_the_event_falls_inside_the_first_window():
@@ -68,6 +74,31 @@ def test_the_event_falls_inside_the_first_window():
     for ev in mf.EVENTS:
         start, event = mf._date(ev["start"]), mf._date(ev["event"])
         assert start < event <= start + timedelta(days=mf.WINDOW_DAYS)
+
+
+def test_no_window_runs_past_the_end_of_the_archive():
+    """E4 is 6 Jan 2025 and the archive stops on 28 Jan, so E4 cannot have seven
+    windows. A truncated final window would be plotted as a whole one and would read as
+    a collapse in every count -- an artefact of the archive ending, not of the event."""
+    end = mf._date(mf.ARCHIVE_END)
+    for ev in mf.EVENTS:
+        n = ev.get("n_windows", mf.N_WINDOWS)
+        last_end = mf._date(ev["start"]) + timedelta(days=mf.WINDOW_DAYS * n)
+        assert last_end <= end, f"{ev['id']} runs past the archive"
+
+    e4 = next(e for e in mf.EVENTS if e["id"] == "E4")
+    assert e4["n_windows"] == 5, "five complete windows fit before 28 Jan, not seven"
+
+
+def test_e2_and_e3_overlap_and_that_is_known():
+    """E2 runs to 16 Nov and E3 starts on 31 Oct, so the pooled fit sees those days
+    twice. Harmless for a window's features (built from its own actions alone) but it
+    does overweight the overlap in the ruler and in the pooled bar. Pinned so the fact
+    is a decision rather than a surprise."""
+    e2 = next(e for e in mf.EVENTS if e["id"] == "E2")
+    e3 = next(e for e in mf.EVENTS if e["id"] == "E3")
+    e2_end = mf._date(e2["start"]) + timedelta(days=mf.WINDOW_DAYS * e2["n_windows"])
+    assert mf._date(e3["start"]) < e2_end
 
 
 # --------------------------------------------------------- the pooled ruler
@@ -289,6 +320,101 @@ def test_colours_are_the_published_colorblind_palette():
     # and specifically not matplotlib's defaults
     assert "#ff7f0e" not in mf.AXIS_COLOUR.values()
     assert "#2ca02c" not in mf.AXIS_COLOUR.values()
+
+
+# -------------------------------------------------------------- head statistics
+
+
+def _fitted(n_events=2, n_windows=4, bar=0.4):
+    windows = fake_windows(n_events=n_events, n_windows=n_windows)
+    emb = fit_pooled([w["X"] for w in windows])
+    Zs = [emb.transform(w["X"]) for w in windows]
+    return windows, Zs, bar
+
+
+def test_the_head_figures_are_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    windows, Zs, bar = _fitted()
+    mf.plot_prevalence(windows, Zs, bar, tmp_path / "prev.pdf")
+    mf.plot_head_intensity(windows, Zs, tmp_path / "head.pdf")
+    mf.plot_concentration(windows, Zs, tmp_path / "conc.pdf")
+    mf.plot_prepost(windows, Zs, bar, tmp_path / "pp.pdf")
+    mf.plot_threshold_sweep(windows, Zs, tmp_path / "sweep.pdf")
+    for name in ("prev.pdf", "head.pdf", "conc.pdf", "pp.pdf", "sweep.pdf"):
+        assert (tmp_path / name).stat().st_size > 1000
+
+
+def test_the_head_figures_survive_a_single_event(tmp_path):
+    """Same trap as plot_evolution: squeeze=False everywhere, or a one-event run dies
+    on an Axes that is not an array."""
+    pytest.importorskip("matplotlib")
+    windows, Zs, bar = _fitted(n_events=1, n_windows=3)
+    mf.plot_prevalence(windows, Zs, bar, tmp_path / "p.pdf")
+    mf.plot_concentration(windows, Zs, tmp_path / "c.pdf")
+    mf.plot_threshold_sweep(windows, Zs, tmp_path / "s.pdf")
+    assert (tmp_path / "p.pdf").stat().st_size > 1000
+
+
+def test_no_windows_at_all_writes_no_head_figures(tmp_path):
+    pytest.importorskip("matplotlib")
+    mf.plot_prevalence([], [], 0.5, tmp_path / "p.pdf")
+    mf.plot_concentration([], [], tmp_path / "c.pdf")
+    mf.plot_head_intensity([], [], tmp_path / "h.pdf")
+    mf.plot_prepost([], [], 0.5, tmp_path / "pp.pdf")
+    mf.plot_threshold_sweep([], [], tmp_path / "s.pdf")
+    assert not any(p.exists() for p in tmp_path.iterdir())
+
+
+def test_the_figures_use_one_bar_for_every_axis_not_a_quantile_each():
+    """The property the whole set rests on, and the bug it shipped with.
+
+    A per-axis quantile puts (1-q) of the population above every axis's bar by
+    construction, reporting three archetypes of wildly different prevalence as equally
+    common. The figures take a single scalar so that cannot be expressed.
+    """
+    import inspect
+    for fn in (mf.plot_prevalence, mf.plot_prepost, mf.write_prevalence_csv):
+        params = list(inspect.signature(fn).parameters)
+        assert "bar" in params and "bars" not in params, f"{fn.__name__} takes one bar"
+    assert mf.COMMON_BAR == 0.5
+
+
+def test_prevalence_csv_carries_every_head_statistic(tmp_path):
+    windows, Zs, bar = _fitted(n_events=2, n_windows=3)
+    mf.write_prevalence_csv(windows, Zs, bar, tmp_path / "prevalence.csv")
+    rows = list(csv.DictReader(open(tmp_path / "prevalence.csv")))
+
+    assert len(rows) == len(windows) * len(mf.AXES)
+    for col in ("threshold", "count", "rate_per_100k", "p99", "p999", "gini",
+                "top1pct_share", "anchor_feature", "anchor_median"):
+        assert col in rows[0]
+    # One bar, frozen, for every window AND every axis.
+    assert {r["threshold"] for r in rows} == {f"{bar:.6f}"}
+
+
+def test_the_bar_is_quoted_in_reshares_not_only_in_score_units(tmp_path):
+    """'score >= 0.5' is unreviewable, and it is not even the same physical bar on the
+    three axes -- each [0,1] is its own pooled PC1 range. 'a median of N reshares
+    received' is the absolute statement, and it is per axis."""
+    windows, Zs, bar = _fitted(n_events=1, n_windows=3)
+    mf.write_prevalence_csv(windows, Zs, bar, tmp_path / "p.csv")
+    rows = list(csv.DictReader(open(tmp_path / "p.csv")))
+    ss = [r for r in rows if r["axis"] == "superspreader"]
+    assert ss[0]["anchor_feature"] == "influence_score"
+    assert float(ss[0]["anchor_median"]) > 0
+
+
+def test_prevalence_is_not_merely_tracking_the_population():
+    """The confound the rate column exists for.
+
+    fake_windows grows the population 200 -> 800 across four windows while the head
+    stays a single account. The count may rise with N; the rate must fall.
+    """
+    windows, Zs, bar = _fitted(n_events=1, n_windows=4)
+    rates = [mf.head_stats(Z[:, 0], bar, "superspreader").rate_per_100k for Z in Zs]
+    ns = [len(w["ids"]) for w in windows]
+    assert ns == [200, 400, 600, 800]
+    assert rates[-1] < rates[0], "a fixed head in a growing population is a falling rate"
 
 
 def test_features_csv_exposes_the_raw_features_behind_each_axis(tmp_path):

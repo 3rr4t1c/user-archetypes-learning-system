@@ -81,8 +81,29 @@ class BucketFit:
         raw = z @ self.loadings
         span = self.hi - self.lo
         if span < _EPS:
+            # No spread on this axis: every user is identical, so there is nothing to
+            # rank. 0.5 is the only honest answer, but it looks exactly like "moderate"
+            # -- see `degenerate` and ArchetypeEmbedder.warnings().
             return np.full(raw.shape[0], 0.5)
         return np.clip((raw - self.lo) / span, 0.0, 1.0)
+
+    @property
+    def degenerate(self) -> bool:
+        """True when the axis carries no information and every user scores 0.5.
+
+        Happens when the bucket's features are (near-)constant across the pooled fit --
+        e.g. co-action features on data too sparse for two users to ever touch the same
+        content within delta_t. The score is then not "moderate coordination", it is no
+        measurement at all, and it must not be read as the former.
+        """
+        return (self.hi - self.lo) < _EPS
+
+    @property
+    def dead_features(self) -> Tuple[str, ...]:
+        """Features contributing nothing: constant across the fit, so zero loading."""
+        return tuple(
+            f for f, w in zip(self.features, self.loadings) if abs(w) < 1e-9
+        )
 
 
 class ArchetypeEmbedder:
@@ -183,16 +204,52 @@ class ArchetypeEmbedder:
 
     # ------------------------------------------------------------------ reporting
 
+    def warnings(self) -> List[str]:
+        """Axes and features that carry no information on this data.
+
+        A degenerate axis scores every user 0.5, which reads as "moderate" and means
+        "not measured". A dead feature is constant across the fit, so PC1 gives it zero
+        weight and the bucket is really running on fewer than four. Both are properties
+        of the data, not bugs, and both must be said out loud rather than left to look
+        like results.
+        """
+        out = []
+        for axis in AXES:
+            fit = self.buckets.get(axis)
+            if fit is None:
+                continue
+            if fit.degenerate:
+                out.append(
+                    f"{axis}: DEGENERATE -- no spread across the pooled fit, so every "
+                    f"user scores 0.5. That is 'not measured', not 'moderate'. This "
+                    f"axis cannot support a claim on this data."
+                )
+            dead = fit.dead_features
+            if dead and not fit.degenerate:
+                out.append(
+                    f"{axis}: {len(dead)}/{len(fit.features)} features contribute "
+                    f"nothing ({', '.join(dead)}) -- constant across the fit, so PC1 "
+                    f"gives them zero weight."
+                )
+        return out
+
     def loadings_table(self) -> str:
         """What each axis is actually made of -- for the paper, and for sanity."""
         lines = []
         for axis in AXES:
             fit = self.buckets[axis]
-            lines.append(f"{axis}:")
+            lines.append(f"{axis}:{'   [DEGENERATE]' if fit.degenerate else ''}")
             for name, w in zip(fit.features, fit.loadings):
-                lines.append(f"    {name:<24} {w:+.3f}")
+                flag = "   <- contributes nothing" if abs(w) < 1e-9 else ""
+                lines.append(f"    {name:<24} {w:+.3f}{flag}")
             lines.append(f"    (raw PC1 range on the pooled fit: "
                          f"{fit.lo:.3f} .. {fit.hi:.3f})")
+        warn = self.warnings()
+        if warn:
+            lines.append("")
+            lines.append("WARNINGS")
+            for w in warn:
+                lines.append(f"  ! {w}")
         return "\n".join(lines)
 
     def to_json(self) -> str:

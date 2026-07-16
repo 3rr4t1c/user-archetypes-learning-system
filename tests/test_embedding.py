@@ -231,3 +231,51 @@ def test_loadings_table_names_every_feature():
         assert name in table
     for axis in AXES:
         assert axis in table
+
+
+# ------------------------------------------------------- degeneracy is not a score
+
+
+def test_a_bucket_with_no_spread_is_flagged_not_silently_scored_half():
+    """The trap this guard exists for.
+
+    When a bucket's features never vary -- e.g. co-action on data too sparse for two
+    users to touch the same content within delta_t -- the axis returns 0.5 for every
+    user. That reads as "moderate coordination". It means "no measurement". Observed
+    for real on a fixture whose reposts never collided.
+    """
+    X = make_X(300)
+    for j, name in enumerate(FEATURE_NAMES):
+        if name in BUCKETS["coordinated"]:
+            X[:, j] = 0.0  # nobody ever co-acts
+
+    emb = ArchetypeEmbedder().fit(X)
+    Z = emb.transform(X)
+
+    coord = AXES.index("coordinated")
+    assert np.allclose(Z[:, coord], 0.5)          # the seductive number
+    assert emb.buckets["coordinated"].degenerate  # ...is flagged
+    assert not emb.buckets["superspreader"].degenerate
+
+    warnings = emb.warnings()
+    assert any("coordinated" in w and "DEGENERATE" in w for w in warnings)
+    assert any("not measured" in w for w in warnings)
+    assert "[DEGENERATE]" in emb.loadings_table()
+
+
+def test_a_single_dead_feature_is_reported_without_killing_the_axis():
+    X = make_X(300)
+    X[:, FEATURE_NAMES.index("niche_co_action")] = 7.0  # constant, so zero loading
+
+    emb = ArchetypeEmbedder().fit(X)
+    fit = emb.buckets["coordinated"]
+    assert not fit.degenerate
+    assert "niche_co_action" in fit.dead_features
+    assert any("contribute nothing" in w for w in emb.warnings())
+    assert "contributes nothing" in emb.loadings_table()
+
+
+def test_healthy_data_produces_no_warnings():
+    emb = ArchetypeEmbedder().fit(make_X(500))
+    assert emb.warnings() == []
+    assert "DEGENERATE" not in emb.loadings_table()

@@ -64,7 +64,7 @@ import numpy as np  # noqa: E402
 
 from arles.actions import MalformedActionError, parse_timestamp  # noqa: E402
 from arles.embedding import AXES, fit_pooled  # noqa: E402
-from arles.features import FeatureExtractor, WindowIndex  # noqa: E402
+from arles.features import FEATURE_NAMES, FeatureExtractor, WindowIndex  # noqa: E402
 from arles.mappers.bluesky import map_row  # noqa: E402
 from arles.streaming import build_index, discover_files, iter_window  # noqa: E402
 
@@ -84,8 +84,40 @@ AXIS_LABEL = {
     "amplifier": "Amplifier",
     "coordinated": "Coordinated",
 }
-AXIS_COLOUR = {"superspreader": "#1f77b4", "amplifier": "#ff7f0e", "coordinated": "#2ca02c"}
+
+#: Seaborn's "colorblind" palette, hard-coded.
+#:
+#: The published figure was drawn with sns.set_palette("colorblind"), so these are its
+#: first three entries. Hard-coding them keeps the published look without making seaborn
+#: a dependency of a repo that otherwise needs only numpy -- and matplotlib's default
+#: tab10 is visibly not the same (#ff7f0e is a brighter orange than #DE8F05, #2ca02c a
+#: grassier green than the teal #029E73).
+AXIS_COLOUR = {
+    "superspreader": "#0173B2",
+    "amplifier": "#DE8F05",
+    "coordinated": "#029E73",
+}
 AXIS_MARKER = {"superspreader": "o", "amplifier": "s", "coordinated": "^"}
+
+#: Approximates seaborn's "whitegrid": white panel, light grey dashed grid, light box.
+STYLE = {
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "font.size": 10,
+    "axes.labelsize": 11,
+    "axes.titlesize": 11,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 9.5,
+    "ytick.labelsize": 9.5,
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#b0b0b0",
+    "axes.linewidth": 0.8,
+    "axes.grid": True,
+    "grid.color": "#d0d0d0",
+    "grid.linestyle": "--",
+    "grid.linewidth": 0.6,
+    "grid.alpha": 0.8,
+}
 
 
 def _date(s):
@@ -166,6 +198,31 @@ def write_windows_csv(windows, Zs, path):
               + [f"{np.median(Z[:, i]):.4f}" for i in range(3)])
 
 
+def write_features_csv(windows, path):
+    """Per-window mean of each of the twelve raw features, before the embedding.
+
+    The axis means cannot tell you *why* an axis moved -- PC1 mixes four features, and
+    it weights them by variance, not by how much you trust them. On the real archive
+    the coordinated loadings came out co_action_size +0.614, co_action_rate +0.594,
+    co_action_latency +0.463, niche_co_action +0.234: PC1 down-weighted the one feature
+    designed to exclude viral pile-ons, because it varies least.
+
+    That matters, because a migration event makes everyone reshare the same few posts,
+    which is exactly what co_action_size rewards. So a jump in the coordinated axis is
+    ambiguous between coordination and a pile-on -- unless niche_co_action moves too.
+    This file is how you check.
+    """
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["event", "window", "start", "n_users"] + list(FEATURE_NAMES))
+        for win in windows:
+            X = win["X"]
+            means = [f"{X[:, i].mean():.4f}" if len(win["ids"]) else ""
+                     for i in range(len(FEATURE_NAMES))]
+            w.writerow([win["event"], win["w"] + 1, win["start"].date(),
+                        len(win["ids"])] + means)
+
+
 def _panels(windows):
     """Only the events that actually have windows, so a partial run still plots.
 
@@ -177,6 +234,17 @@ def _panels(windows):
 
 
 def plot_evolution(windows, Zs, path):
+    """The published figure's layout, on the pooled ruler.
+
+    Three details are deliberate, and each was wrong in the first version:
+
+    * Ticks sit exactly on the window starts, one per data point. matplotlib's automatic
+      date locator picks its own interval (6 days against 5-day windows), so most ticks
+      land between points and label nothing in particular.
+    * Labels are "%d %b" -- "25 Aug". ISO dates are twice as wide and collide.
+    * Colours are seaborn's colorblind palette, as the published figure used. tab10's
+      orange and green are visibly different.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -184,32 +252,46 @@ def plot_evolution(windows, Zs, path):
     events = _panels(windows)
     if not events:
         return
-    fig, axes = plt.subplots(len(events), 1, figsize=(7.0, 3.0 * len(events)),
-                             squeeze=False)
-    axes = axes[:, 0]
-    for panel, ev in enumerate(events):
-        ax = axes[panel]
-        idx = [i for i, w in enumerate(windows)
-               if w["event"] == ev["id"] and len(w["ids"])]
-        xs = [windows[i]["start"] for i in idx]
-        for a, axis in enumerate(AXES):
-            ys = [Zs[i][:, a].mean() for i in idx]
-            ax.plot(xs, ys, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
-                    label=AXIS_LABEL[axis], linewidth=1.6, markersize=5)
-        ax.axvline(_date(ev["event"]), color="red", linestyle="--", linewidth=1.2)
-        ax.annotate(ev["id"], xy=(_date(ev["event"]), ax.get_ylim()[1]),
-                    xytext=(0, 4), textcoords="offset points",
-                    ha="center", fontsize=10)
-        ax.set_ylabel("Archetype score")
-        ax.grid(alpha=0.25, linestyle=":")
-        ax.margins(x=0.02)
-        for label in ax.get_xticklabels():
-            label.set_rotation(0)
-    # One legend, one shared scale: the whole point of the pooled fit.
-    axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, 1.28), ncol=3, frameon=False)
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(len(events), 1, figsize=(7.2, 3.1 * len(events)),
+                                 squeeze=False)
+        axes = axes[:, 0]
+        for panel, ev in enumerate(events):
+            ax = axes[panel]
+            idx = [i for i, w in enumerate(windows)
+                   if w["event"] == ev["id"] and len(w["ids"])]
+            xs = [windows[i]["start"] for i in idx]
+
+            for a, axis in enumerate(AXES):
+                ys = [Zs[i][:, a].mean() for i in idx]
+                ax.plot(xs, ys, marker=AXIS_MARKER[axis], color=AXIS_COLOUR[axis],
+                        label=AXIS_LABEL[axis], linewidth=1.8, markersize=5.5,
+                        markeredgewidth=0, clip_on=False, zorder=3)
+
+            # One tick per window, on the point. Nothing is being interpolated between
+            # them, so a tick anywhere else invites the reader to think otherwise.
+            ax.set_xticks(xs)
+            ax.set_xticklabels([d.strftime("%d %b") for d in xs])
+            ax.set_xlim(xs[0] - timedelta(days=1.2), xs[-1] + timedelta(days=1.2))
+
+            ax.axvline(_date(ev["event"]), color="#d62728", linestyle="--",
+                       linewidth=1.3, zorder=2)
+            ax.set_ylabel("Archetype score")
+            ax.set_axisbelow(True)
+
+            # The event label goes above the panel, clear of the lines.
+            ax.annotate(ev["id"], xy=(_date(ev["event"]), 1.0),
+                        xycoords=("data", "axes fraction"),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=10)
+
+        # One legend for both panels: they share a scale, which is the whole point.
+        axes[0].legend(loc="lower center", bbox_to_anchor=(0.5, 1.10), ncol=3,
+                       frameon=False, handlelength=2.4, columnspacing=2.5)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def plot_archetype_space(windows, Zs, path, max_points=4000):
@@ -328,6 +410,7 @@ def main():
     (out / "archetype_fit.json").write_text(embedder.to_json())
     (out / "loadings.txt").write_text(embedder.loadings_table() + "\n")
     write_windows_csv(windows, Zs, out / "windows.csv")
+    write_features_csv(windows, out / "features.csv")
 
     plot_evolution(windows, Zs, out / "archetype_evolution_e1_e2.pdf")
     plot_archetype_space(windows, Zs, out / "archetype_space.pdf")

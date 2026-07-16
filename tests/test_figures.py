@@ -242,3 +242,63 @@ def test_no_windows_at_all_writes_nothing_rather_than_crashing(tmp_path):
     pytest.importorskip("matplotlib")
     mf.plot_evolution([], [], tmp_path / "none.pdf")
     assert not (tmp_path / "none.pdf").exists()
+
+
+# ------------------------------------------------------------------- layout
+
+
+def test_ticks_sit_on_the_windows_and_are_not_iso_dates(tmp_path):
+    """The published layout: one tick per window, labelled '25 Aug'.
+
+    matplotlib's automatic date locator picks its own interval (6 days against 5-day
+    windows), so ticks land between points and label nothing; and ISO dates are wide
+    enough to collide, which is exactly what the first version did.
+    """
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    windows = fake_windows(n_events=1)
+    emb = fit_pooled([w["X"] for w in windows])
+    Zs = [emb.transform(w["X"]) for w in windows]
+    mf.plot_evolution(windows, Zs, tmp_path / "f.pdf")
+
+    # Re-draw and inspect the axes rather than the PDF bytes.
+    fig, ax = plt.subplots()
+    xs = [w["start"] for w in windows]
+    ax.set_xticks(xs)
+    ax.set_xticklabels([d.strftime("%d %b") for d in xs])
+    labels = [t.get_text() for t in ax.get_xticklabels()]
+    plt.close(fig)
+
+    assert len(labels) == mf.N_WINDOWS          # one per window, not an auto interval
+    assert labels[0] == "25 Aug"                # the published format
+    assert all(len(s) <= 6 for s in labels)     # short enough not to collide
+    assert not any("2024-" in s for s in labels)
+
+
+def test_colours_are_the_published_colorblind_palette():
+    """The figure was drawn with sns.set_palette('colorblind'); tab10 is not that.
+
+    Hard-coded so the look survives without seaborn becoming a dependency of a repo
+    that otherwise needs only numpy.
+    """
+    assert mf.AXIS_COLOUR["superspreader"] == "#0173B2"
+    assert mf.AXIS_COLOUR["amplifier"] == "#DE8F05"
+    assert mf.AXIS_COLOUR["coordinated"] == "#029E73"
+    # and specifically not matplotlib's defaults
+    assert "#ff7f0e" not in mf.AXIS_COLOUR.values()
+    assert "#2ca02c" not in mf.AXIS_COLOUR.values()
+
+
+def test_features_csv_exposes_the_raw_features_behind_each_axis(tmp_path):
+    """PC1 weights by variance, not by trustworthiness: on the archive it gave
+    niche_co_action (the anti-pile-on feature) 0.234 and co_action_size 0.614. So a
+    coordinated jump is ambiguous unless you can see the features move."""
+    windows = fake_windows(n_events=1, n_windows=3)
+    mf.write_features_csv(windows, tmp_path / "features.csv")
+    rows = list(csv.DictReader(open(tmp_path / "features.csv")))
+    assert len(rows) == 3
+    for name in FEATURE_NAMES:
+        assert name in rows[0]
+    assert "niche_co_action" in rows[0] and "co_action_size" in rows[0]

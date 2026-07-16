@@ -1,10 +1,16 @@
 """Tests for the confidence score.
 
-Confidence answers "how much evidence supports this user's vector", so its volume term
-counts the repost events the user is involved in -- as resharer or as the author being
-reshared -- and not their total activity. A user with 500 replies and one repost has
-almost nothing behind their archetype, and confidence must say so. That is the
-content-agnostic form of the target variable in Verdolotti et al.
+Confidence answers "how much of this account have we seen" -- data availability -- and
+so combines, per the design:
+
+    volume (50%)   log-scaled total actions
+    recency (30%)  time since last activity
+    lifespan (20%) total days observed
+
+Volume counts *total* actions, not only the reposts the features read. Two users with
+five reposts each are not equally well observed if one also made 500 replies: we watched
+that account act 500 times and it chose not to reshare, which makes its low amplifier
+score a measurement rather than missing data.
 
 Two bugs are pinned here:
 
@@ -69,11 +75,42 @@ def test_extractor_exposes_confidence_aligned_with_the_feature_matrix():
     assert np.all((c >= 0.0) & (c <= 1.0))
 
 
-def test_volume_counts_both_sides_of_a_reshare():
-    """The author being reshared has evidence too -- it is what the vector is built
-    from. Verdolotti et al.'s target counts both sides for the same reason."""
+def test_volume_counts_total_actions_not_just_the_ones_features_read():
+    """Confidence is data availability: how much of the account have we seen?
+
+    Two users with identical repost behaviour are not equally well observed if one of
+    them also replies constantly. We watched that account act 500 times and it chose
+    not to reshare -- its low amplifier score is a measurement, not missing data.
+    """
+    shared = [repost("quiet", f"p{i}", f"a{i}", i) for i in range(3)]
+    shared += [repost("chatty", f"q{i}", f"a{i}", i) for i in range(3)]
+    chatty_replies = [
+        CanonicalAction(f"reply{i}", "chatty", "reply",
+                        START + timedelta(minutes=i), f"p{i}", "someone")
+        for i in range(200)
+    ]
+    fx = build(shared + chatty_replies)
+    assert conf_of(fx, "chatty") > conf_of(fx, "quiet")
+
+
+def test_replies_do_not_add_a_row_to_the_feature_matrix():
+    """Activity feeds confidence, but only reposts earn a place in the output."""
+    actions = [repost("u1", "p1", "alice", 0)]
+    actions += [
+        CanonicalAction(f"r{i}", "lurker", "reply", START + timedelta(minutes=i),
+                        "p1", "alice")
+        for i in range(50)
+    ]
+    fx = build(actions)
+    ids, _ = fx.finish()
+    assert "lurker" not in ids, "a pure replier must not appear as an all-zero row"
+
+
+def test_an_author_who_never_acts_is_scored_on_the_reshares_they_received():
+    """They took no action, so their activity is what others did to their content."""
     fx = build([repost(f"u{i}", "p1", "alice", i) for i in range(20)])
-    # alice performs no reposts at all, but is reshared 20 times.
+    ids, _ = fx.confidence()
+    assert "alice" in ids
     assert conf_of(fx, "alice") > conf_of(fx, "u0")
 
 
@@ -157,8 +194,9 @@ def test_single_instant_window_does_not_divide_by_zero():
 
 
 def test_confidence_scores_is_pure_and_vectorised():
+    """Monotone in volume, bounded, no side effects."""
     conf = confidence_scores(
-        involvement=np.array([0.0, 1.0, 20.0, 1000.0]),
+        activity=np.array([0.0, 1.0, 20.0, 1000.0]),
         first_seen=np.full(4, START.timestamp()),
         last_seen=np.full(4, END.timestamp()),
         window_start=START,

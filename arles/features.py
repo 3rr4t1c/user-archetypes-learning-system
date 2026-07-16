@@ -15,12 +15,13 @@ practical consequence is that ArLeS runs on any platform that can export reshare
 (who reshared, what, whose it was, when), which is close to the minimum any reshare-
 bearing platform can offer.
 
-Confidence follows the same logic: a user's evidence is the repost events they are
-involved in, as resharer or as reshared author. That is the content-agnostic form of
-the target variable in Verdolotti et al., "the total number of reshares in which the
-user is engaged -- either as the original author whose posts are amplified by others,
-or as a user who actively reshares such content". It is not a measure of how busy the
-account is.
+Confidence is the exception, and deliberately so. It measures data availability --
+how much of an account we have seen -- and so counts *total* actions, including the
+replies and follows no feature reads. Two users with five reposts each are not equally
+well observed if one also made 500 replies: we watched that account act 500 times and
+it chose not to reshare, which makes its low amplifier score a measurement rather than
+missing data. Supplying only reposts is still fine; volume then degrades to the repost
+count, which describe_coverage reports.
 
 Why two passes
 --------------
@@ -268,6 +269,18 @@ class FeatureExtractor:
         self._content: List[int] = []
         self._actor: List[int] = []
 
+        # Activity ledger for the confidence score. Keyed by actor id rather than by
+        # interned slot, deliberately: an account that only replies must contribute to
+        # its own confidence without being added to the feature matrix, where it would
+        # sit as an all-zero row it never earned.
+        #
+        # The features need only reposts; confidence additionally uses total activity,
+        # which is what "how much of this account have we seen" means. It is close to
+        # free, since the pipeline already streams every row and filters to reposts.
+        self._activity_count: Dict[str, int] = defaultdict(int)
+        self._activity_first: Dict[str, float] = {}
+        self._activity_last: Dict[str, float] = {}
+
     # ------------------------------------------------------------------ interning
 
     def _actor_slot(self, actor_id: str) -> int:
@@ -290,7 +303,15 @@ class FeatureExtractor:
     # ------------------------------------------------------------------ ingestion
 
     def add(self, action: CanonicalAction) -> None:
-        """Buffer one repost. Non-reposts are ignored (see the module docstring)."""
+        """Record one action. Only reposts feed the features; all of them feed confidence."""
+        ts = action.created_at.timestamp()
+        actor = action.actor_id
+        self._activity_count[actor] += 1
+        if actor not in self._activity_first or ts < self._activity_first[actor]:
+            self._activity_first[actor] = ts
+        if actor not in self._activity_last or ts > self._activity_last[actor]:
+            self._activity_last[actor] = ts
+
         if action.activity_type != "repost" or not action.parent_id:
             return
         if action.is_self_reshare or not action.parent_actor_id:
@@ -330,32 +351,53 @@ class FeatureExtractor:
     def confidence(self) -> Tuple[List[str], np.ndarray]:
         """(user_ids, confidence) in [0,1], aligned with finish()'s rows.
 
-        A user's evidence is the repost events they are involved in -- as resharer or
-        as the author being reshared. Both sides count, because both are what the
-        vector is computed from.
+        How much of this account have we actually seen? That is data availability, and
+        it is measured over the user's whole activity, not only the reposts the features
+        happen to read. Two users with five reposts each are not equally well observed
+        if one of them also made 500 replies: we have watched that account act 500 times
+        and it chose not to reshare, so its low amplifier score is a measurement. The
+        other may simply be new.
+
+        Authors who are reshared but never act themselves have no activity of their own;
+        the reshares they received are what we have seen of them, so those count.
         """
         n_actors = len(self._actor_ids)
-        if not self._ts or n_actors == 0:
+        if n_actors == 0:
             return [], np.zeros(0, dtype=np.float64)
 
-        ts, content, actor, content_author, content_n = self.sorted_buffer()
+        window_start_ts = self.window_start.timestamp()
+        counts = np.zeros(n_actors, dtype=np.float64)
+        first = np.full(n_actors, np.inf)
+        last = np.full(n_actors, -np.inf)
 
-        involvement = np.bincount(actor, minlength=n_actors).astype(np.float64)
-        # The author of each reshared post is involved in every reshare of it.
-        np.add.at(involvement, content_author, content_n)
+        for i, uid in enumerate(self._actor_ids):
+            counts[i] = self._activity_count.get(uid, 0)
+            if uid in self._activity_first:
+                first[i] = self._activity_first[uid]
+                last[i] = self._activity_last[uid]
 
-        first_seen = np.full(n_actors, np.inf)
-        last_seen = np.full(n_actors, -np.inf)
-        for side in (actor, content_author[content]):
-            np.minimum.at(first_seen, side, ts)
-            np.maximum.at(last_seen, side, ts)
+        # A user in the matrix who never acted is there because they were reshared.
+        # Those reshares are what we observed of them, so they are their activity.
+        if self._ts:
+            ts, content, actor, content_author, content_n = self.sorted_buffer()
+            received = np.zeros(n_actors, dtype=np.float64)
+            np.add.at(received, content_author, content_n)
+            passive = counts == 0
+            counts[passive] = received[passive]
 
-        unseen = ~np.isfinite(first_seen)
-        first_seen[unseen] = self.window_start.timestamp()
-        last_seen[unseen] = self.window_start.timestamp()
+            r_first = np.full(n_actors, np.inf)
+            r_last = np.full(n_actors, -np.inf)
+            np.minimum.at(r_first, content_author[content], ts)
+            np.maximum.at(r_last, content_author[content], ts)
+            first[passive] = r_first[passive]
+            last[passive] = r_last[passive]
+
+        unseen = ~np.isfinite(first)
+        first[unseen] = window_start_ts
+        last[unseen] = window_start_ts
 
         conf = confidence_scores(
-            involvement, first_seen, last_seen, self.window_start, self.window_end
+            counts, first, last, self.window_start, self.window_end
         )
         return list(self._actor_ids), conf
 
@@ -573,22 +615,24 @@ class FeatureExtractor:
 
 
 def confidence_scores(
-    involvement: np.ndarray,
+    activity: np.ndarray,
     first_seen: np.ndarray,
     last_seen: np.ndarray,
     window_start: datetime,
     window_end: datetime,
-    reference_involvement: int = 10,
+    reference_activity: int = 10,
 ) -> np.ndarray:
     """How much evidence supports each user's vector, in [0,1].
 
-    volume (50%)   log-scaled repost events the user is involved in, as resharer or as
-                   reshared author -- the content-agnostic form of the target variable
-                   in Verdolotti et al. It measures evidence for *this vector*, not how
-                   talkative the account is: a user with 500 replies and one repost has
-                   almost nothing behind their archetype, and confidence should say so.
-    recency (30%)  how close to the window's end their last involvement was
-    lifespan (20%) how much of the window their involvement spans
+    volume (50%)   log-scaled total actions
+    recency (30%)  time since last activity, measured to the window's end
+    lifespan (20%) total days observed, as a fraction of the window
+
+    This is data availability: how much of the account have we seen? It is deliberately
+    not "evidence for the vector". A user with five reposts among 500 replies is far
+    better observed than one with five reposts and nothing else -- we watched the first
+    account act 500 times and it chose not to reshare, which makes its low amplifier
+    score a measurement rather than an absence of data.
 
     Both time terms are measured against the window and normalised by its duration,
     never against the wall clock. Two bugs motivated that: using datetime.now() as the
@@ -598,7 +642,7 @@ def confidence_scores(
     recency into [0.85, 1] and lifespan into [0, 0.167], so neither discriminated and
     the documented 30%/20% weights did nothing.
     """
-    n = len(involvement)
+    n = len(activity)
     if n == 0:
         return np.zeros(0, dtype=np.float64)
 
@@ -606,7 +650,7 @@ def confidence_scores(
     end_ts = window_end.timestamp()
 
     volume = np.minimum(
-        1.0, np.log1p(involvement) / math.log1p(2 * reference_involvement)
+        1.0, np.log1p(activity) / math.log1p(2 * reference_activity)
     )
     days_since = np.maximum(0.0, (end_ts - last_seen) / 86400.0)
     recency = np.exp(-days_since / (window_days / 3.0))

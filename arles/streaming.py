@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from .arles import MalformedActionError, parse_timestamp
+from .actions import MalformedActionError, parse_timestamp
 
 # Rows can carry long post text; the stdlib default (128 KB) is generous but the
 # archive has been seen to exceed it on pathological rows.

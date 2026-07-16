@@ -214,10 +214,16 @@ results/
 
 # Files
 .DS_Store
-# ArLeS working artefacts
-.arles_windows/          # cached per-window buffers (regenerable, ~100MB each)
-.arles_index.json        # cached per-file time index of the archive
-*.npz                    # window buffers
+# ArLeS working artefacts.
+# NB: .gitignore has no inline comments -- a trailing '#' is part of the pattern,
+# so a rule with one silently matches nothing.
+
+# Cached per-window buffers (regenerable, ~100MB each).
+.arles_windows/
+# Cached per-file time index of the archive.
+.arles_index.json
+# Window buffers.
+*.npz
 
 # Tuning outputs: keep the surface you cite in the paper, ignore scratch runs.
 # `git add -f tuning_surface.json` if it is the one behind a reported number.

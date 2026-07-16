@@ -20,7 +20,7 @@ authors reaching h>=2; on the full archive the same window gives mean 14.46 and 
 The axis is estimable on the full archive and not on the sample.
 
 Reshares are attributed to the original author by parsing the DID out of the AT-URI
-(arles.arles.author_of_uri), which resolves 100% of reposts, instead of requiring the
+(arles.actions.author_of_uri), which resolves 100% of reposts, instead of requiring the
 original post to be present in the file (0.09% in the sampled data).
 
 Why --windows matters
@@ -70,7 +70,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from arles.arles import MalformedActionError, author_of_uri, parse_timestamp  # noqa: E402
+from arles.actions import MalformedActionError, author_of_uri, parse_timestamp  # noqa: E402
 from arles.streaming import (  # noqa: E402
     build_index,
     check_contiguous,
@@ -84,7 +84,7 @@ _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def parse_cli_datetime(value):
     """Parse a --start argument: a bare date (2024-10-12) or a full timestamp.
 
-    Deliberately more permissive than arles.arles.parse_timestamp. The two have
+    Deliberately more permissive than arles.actions.parse_timestamp. The two have
     different contracts:
 
       * A *data row* with no time component means the timestamp column lost

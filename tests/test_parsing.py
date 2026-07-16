@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from arles.arles import Action, MalformedActionError, author_of_uri, parse_timestamp
+from arles.actions import Action, MalformedActionError, author_of_uri, parse_timestamp
 
 
 # Every fractional-second width that actually occurs in the dataset. Counted over

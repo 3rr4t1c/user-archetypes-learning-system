@@ -1,7 +1,7 @@
 """Tests for the diagnostic scripts' command-line parsing.
 
 These exist because of a real failure: --start was documented as taking an ISO date
-and was then handed straight to arles.arles.parse_timestamp, which rejects anything
+and was then handed straight to arles.actions.parse_timestamp, which rejects anything
 without a time component. `--start 2024-10-12` blew up with a traceback.
 
 The distinction being pinned here is deliberate and worth keeping:
@@ -56,7 +56,7 @@ def test_invalid_start_raises_argparse_error_not_a_traceback(bad):
 
 def test_cli_leniency_does_not_leak_into_the_data_parser():
     """A bare date must still be rejected for a data row."""
-    from arles.arles import MalformedActionError, parse_timestamp
+    from arles.actions import MalformedActionError, parse_timestamp
 
     with pytest.raises(MalformedActionError):
         parse_timestamp("2024-10-12")

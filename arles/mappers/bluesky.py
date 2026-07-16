@@ -26,7 +26,7 @@ Three platform quirks are resolved here rather than leaking into the metrics.
    the receiving end. The URI is authoritative and is what we use.
 
 3. Timestamps are client-supplied and come in several shapes.
-   Handled by arles.arles.parse_timestamp. See also arles.streaming: the archive is
+   Handled by arles.actions.parse_timestamp. See also arles.streaming: the archive is
    ordered by ingestion, not by created_at, which can deviate by up to ~18.6 h.
 
 Usage
@@ -46,7 +46,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
-from ..arles import MalformedActionError, author_of_uri, parse_timestamp
+from ..actions import MalformedActionError, author_of_uri, parse_timestamp
 from ..schema import CANONICAL_COLUMNS, CanonicalAction, describe_coverage
 from ..streaming import build_index, discover_files, iter_window
 

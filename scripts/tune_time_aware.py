@@ -53,7 +53,7 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from arles.arles import MalformedActionError, parse_timestamp  # noqa: E402
+from arles.actions import MalformedActionError, parse_timestamp  # noqa: E402
 from arles.features import FeatureExtractor, WindowIndex  # noqa: E402
 from arles.mappers.bluesky import map_row  # noqa: E402
 from arles.streaming import build_index, discover_files, iter_window  # noqa: E402
@@ -61,7 +61,7 @@ from arles.tuning import (  # noqa: E402
     DEFAULT_ALPHAS,
     DEFAULT_DELTAS,
     aggregate,
-    format_baselines,
+
     format_grid,
     grid_search,
     involvement_target,
@@ -69,7 +69,6 @@ from arles.tuning import (  # noqa: E402
 )
 
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
 
 def parse_cli_datetime(value):
     s = value.strip()
@@ -82,7 +81,6 @@ def parse_cli_datetime(value):
             f"invalid --start {value!r}: expected YYYY-MM-DD or a full ISO timestamp"
         )
 
-
 def parse_delta(text):
     m = re.match(r"^(\d+(?:\.\d+)?)(min|h|d)$", text.strip())
     if not m:
@@ -93,10 +91,8 @@ def parse_delta(text):
     unit_map = {"min": "minutes", "h": "hours", "d": "days"}
     return timedelta(**{unit_map[unit]: v})
 
-
 def _cache_key(start, end):
     return f"win_{start.strftime('%Y%m%dT%H%M%S')}_{end.strftime('%Y%m%dT%H%M%S')}"
-
 
 def load_window(files, spans, start, end, progress=True, cache_dir=None):
     """Both passes over one window. Returns (extractor, index).
@@ -147,7 +143,6 @@ def load_window(files, spans, start, end, progress=True, cache_dir=None):
         if progress:
             print(f"  cached: {cache_path.name}")
     return fx, index
-
 
 def main():
     ap = argparse.ArgumentParser(
@@ -263,8 +258,6 @@ def main():
     print(format_grid(merged, "tash_index"))
     print()
     print(format_grid(merged, "tai_score"))
-    print()
-    print(format_baselines(merged))
 
     if args.save:
         payload = [
@@ -298,7 +291,6 @@ def main():
         print(f"               (Verdolotti et al.: {prior})")
     print(f"\nelapsed: {(time.time() - t0)/60:.1f} min")
 
-
 def _fmt(d):
     s = d.total_seconds()
     if s < 3600:
@@ -306,7 +298,6 @@ def _fmt(d):
     if s < 86400:
         return f"{s / 3600:g}h"
     return f"{s / 86400:g}d"
-
 
 if __name__ == "__main__":
     main()

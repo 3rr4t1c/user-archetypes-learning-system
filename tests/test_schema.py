@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from arles.arles import MalformedActionError
+from arles.actions import MalformedActionError
 from arles.mappers.bluesky import collection_of_uri, map_row
 from arles.schema import (
     ACTIVITY_TYPES,

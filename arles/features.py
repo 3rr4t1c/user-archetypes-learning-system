@@ -327,6 +327,38 @@ class FeatureExtractor:
             np.asarray(self._content_n, dtype=np.int64),
         )
 
+    def confidence(self) -> Tuple[List[str], np.ndarray]:
+        """(user_ids, confidence) in [0,1], aligned with finish()'s rows.
+
+        A user's evidence is the repost events they are involved in -- as resharer or
+        as the author being reshared. Both sides count, because both are what the
+        vector is computed from.
+        """
+        n_actors = len(self._actor_ids)
+        if not self._ts or n_actors == 0:
+            return [], np.zeros(0, dtype=np.float64)
+
+        ts, content, actor, content_author, content_n = self.sorted_buffer()
+
+        involvement = np.bincount(actor, minlength=n_actors).astype(np.float64)
+        # The author of each reshared post is involved in every reshare of it.
+        np.add.at(involvement, content_author, content_n)
+
+        first_seen = np.full(n_actors, np.inf)
+        last_seen = np.full(n_actors, -np.inf)
+        for side in (actor, content_author[content]):
+            np.minimum.at(first_seen, side, ts)
+            np.maximum.at(last_seen, side, ts)
+
+        unseen = ~np.isfinite(first_seen)
+        first_seen[unseen] = self.window_start.timestamp()
+        last_seen[unseen] = self.window_start.timestamp()
+
+        conf = confidence_scores(
+            involvement, first_seen, last_seen, self.window_start, self.window_end
+        )
+        return list(self._actor_ids), conf
+
     def save_buffer(self, path: str) -> None:
         """Persist the pass-2 buffer so a window never has to be re-read.
 
@@ -541,8 +573,6 @@ class FeatureExtractor:
 
 
 def confidence_scores(
-    user_ids: Sequence[str],
-    X: np.ndarray,
     involvement: np.ndarray,
     first_seen: np.ndarray,
     last_seen: np.ndarray,
@@ -554,21 +584,25 @@ def confidence_scores(
 
     volume (50%)   log-scaled repost events the user is involved in, as resharer or as
                    reshared author -- the content-agnostic form of the target variable
-                   in Verdolotti et al., not a measure of how talkative the account is.
+                   in Verdolotti et al. It measures evidence for *this vector*, not how
+                   talkative the account is: a user with 500 replies and one repost has
+                   almost nothing behind their archetype, and confidence should say so.
     recency (30%)  how close to the window's end their last involvement was
     lifespan (20%) how much of the window their involvement spans
 
     Both time terms are measured against the window and normalised by its duration,
-    never against the wall clock. See ArchetypeLearner._compute_confidence_scores for
-    the two bugs that motivated this.
+    never against the wall clock. Two bugs motivated that: using datetime.now() as the
+    reference made a 2024 window score recency ~5e-10 for every user (so a >=0.5 gate
+    rejected 100% of them, and the result depended on the date of the run); and
+    normalising both terms by a hard-coded 30 days against a 5-day window squashed
+    recency into [0.85, 1] and lifespan into [0, 0.167], so neither discriminated and
+    the documented 30%/20% weights did nothing.
     """
-    n = len(user_ids)
+    n = len(involvement)
     if n == 0:
         return np.zeros(0, dtype=np.float64)
 
-    window_days = max(
-        (window_end - window_start).total_seconds() / 86400.0, 1e-9
-    )
+    window_days = max((window_end - window_start).total_seconds() / 86400.0, 1e-9)
     end_ts = window_end.timestamp()
 
     volume = np.minimum(
@@ -576,7 +610,9 @@ def confidence_scores(
     )
     days_since = np.maximum(0.0, (end_ts - last_seen) / 86400.0)
     recency = np.exp(-days_since / (window_days / 3.0))
-    lifespan = np.minimum(1.0, np.maximum(0.0, last_seen - first_seen) / 86400.0 / window_days)
+    lifespan = np.minimum(
+        1.0, np.maximum(0.0, last_seen - first_seen) / 86400.0 / window_days
+    )
 
     conf = 0.5 * volume + 0.3 * recency + 0.2 * lifespan
     return np.clip(conf, 0.0, 1.0)

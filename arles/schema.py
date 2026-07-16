@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from .arles import MalformedActionError, parse_timestamp
+from .actions import MalformedActionError, parse_timestamp
 
 #: The canonical column names, in order.
 CANONICAL_COLUMNS = (

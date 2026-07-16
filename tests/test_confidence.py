@@ -1,16 +1,22 @@
 """Tests for the confidence score.
 
+Confidence answers "how much evidence supports this user's vector", so its volume term
+counts the repost events the user is involved in -- as resharer or as the author being
+reshared -- and not their total activity. A user with 500 replies and one repost has
+almost nothing behind their archetype, and confidence must say so. That is the
+content-agnostic form of the target variable in Verdolotti et al.
+
 Two bugs are pinned here:
 
 1. The recency term used datetime.now() as its reference. Once timestamps parse
    correctly (before that fix they were all now(), which hid this), a 2024 window
-   scored recency ~ 5e-10 for every user and the confidence >= 0.5 gate rejected
-   100% of them. The score also silently depended on the date of the run.
+   scored recency ~5e-10 for every user and a confidence >= 0.5 gate rejected 100% of
+   them. The score also silently depended on the date of the run.
 
 2. Both time terms were normalised by a hard-coded 30 days against a 5-day analysis
-   window, squashing recency into [0.85, 1] and lifespan into [0, 0.167]. Neither
-   could discriminate between users, so the documented 30% and 20% weights did
-   nothing and confidence was really just the volume term.
+   window, squashing recency into [0.85, 1] and lifespan into [0, 0.167]. Neither could
+   discriminate between users, so the documented 30% and 20% weights did nothing and
+   confidence was really just the volume term.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -18,132 +24,146 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
-from arles.arles import Action, ArchetypeLearner
+from arles.features import FeatureExtractor, WindowIndex, confidence_scores
+from arles.schema import CanonicalAction
 
-WINDOW_START = datetime(2024, 10, 3, tzinfo=timezone.utc)
+START = datetime(2024, 10, 12, tzinfo=timezone.utc)
+END = START + timedelta(days=5)
 
 
-def _action(user, when, action_id="a", activity="post"):
-    return Action(
-        action_id=f"at://did:plc:{user}/app.bsky.feed.post/{action_id}",
-        created_at=when,
-        author_user_id=user,
-        target_user_id=None,
-        original_action_id=None,
-        activity_type=activity,
-        text=None,
+def repost(actor, parent, parent_actor, minutes):
+    return CanonicalAction(
+        action_id=f"r-{actor}-{parent}-{minutes}",
+        actor_id=actor,
+        activity_type="repost",
+        created_at=START + timedelta(minutes=minutes),
+        parent_id=parent,
+        parent_actor_id=parent_actor,
     )
 
 
-def _learner_over_window(users_actions):
-    """users_actions: {user: [offsets in hours from WINDOW_START]}"""
-    learner = ArchetypeLearner()
-    for user, offsets in users_actions.items():
-        for i, h in enumerate(offsets):
-            learner.process_action(
-                _action(user, WINDOW_START + timedelta(hours=h), action_id=f"p{i}")
-            )
-    return learner
+def build(actions, start=START, end=END):
+    index = WindowIndex.build(actions)
+    fx = FeatureExtractor(index, start, end)
+    for a in actions:
+        fx.add(a)
+    return fx
+
+
+def conf_of(fx, user):
+    ids, c = fx.confidence()
+    return c[ids.index(user)]
+
+
+# ------------------------------------------------------------------ wiring
+
+
+def test_extractor_exposes_confidence_aligned_with_the_feature_matrix():
+    """It must actually be reachable: the first version of this function was written
+    and never called, so the pipeline shipped with no confidence output at all."""
+    fx = build([repost(f"u{i}", "p1", "alice", i) for i in range(5)])
+    ids_x, X = fx.finish()
+    ids_c, c = fx.confidence()
+    assert ids_x == ids_c
+    assert c.shape[0] == X.shape[0]
+    assert np.all((c >= 0.0) & (c <= 1.0))
+
+
+def test_volume_counts_both_sides_of_a_reshare():
+    """The author being reshared has evidence too -- it is what the vector is built
+    from. Verdolotti et al.'s target counts both sides for the same reason."""
+    fx = build([repost(f"u{i}", "p1", "alice", i) for i in range(20)])
+    # alice performs no reposts at all, but is reshared 20 times.
+    assert conf_of(fx, "alice") > conf_of(fx, "u0")
+
+
+# ------------------------------------------------------------------ bug 1
 
 
 def test_confidence_does_not_depend_on_the_wall_clock():
-    """The regression test for bug 1.
+    """Historical data must not be penalised for being historical.
 
-    Historical data must not be penalised for being historical: two windows with an
-    identical internal structure must score identically, however far apart they sit
-    from today. Under the old code the 2024 window scored ~5e-10 on recency and the
-    recent one ~1.0, purely because of when the script happened to run.
+    Two windows with identical internal structure must score identically however far
+    apart they sit from today. Under the old code the 2024 window scored ~5e-10 on
+    recency and a recent one ~1.0, purely because of when the script ran.
     """
-    pattern = [0, 24, 48, 72, 96, 120]
+    pattern = [0, 24 * 60, 48 * 60, 72 * 60, 96 * 60, 120 * 60]
+    old = build([repost("u1", f"p{i}", "alice", m) for i, m in enumerate(pattern)])
+    old_ids, old_conf = old.confidence()
 
-    old = _learner_over_window({"u1": pattern})
-    old_conf = old._compute_confidence_scores(old.next_user_idx)
-
-    recent = ArchetypeLearner()
     base = datetime.now(timezone.utc) - timedelta(days=5)
-    for i, h in enumerate(pattern):
-        recent.process_action(
-            _action("u1", base + timedelta(hours=h), action_id=f"p{i}")
-        )
-    recent_conf = recent._compute_confidence_scores(recent.next_user_idx)
+    recent_actions = [
+        CanonicalAction(f"r{i}", "u1", "repost", base + timedelta(minutes=m),
+                        f"p{i}", "alice")
+        for i, m in enumerate(pattern)
+    ]
+    recent = build(recent_actions, start=base, end=base + timedelta(days=5))
+    recent_ids, recent_conf = recent.confidence()
 
-    assert old_conf[0] == pytest.approx(recent_conf[0], abs=1e-6)
-
-    # And the score must be high on its merits: this user is active throughout the
-    # window and right up to its end, so recency and lifespan are both maxed. Volume
-    # is the only term short of 1.0 (6 actions against the 2 * min_actions = 20
-    # saturation point), which caps the total at ~0.82.
-    assert old_conf[0] > 0.8
-
-
-def test_recency_reference_is_the_window_end_not_now():
-    learner = _learner_over_window({"u1": [0, 60, 120]})
-    n = learner.next_user_idx
-    implicit = learner._compute_confidence_scores(n)
-    explicit = learner._compute_confidence_scores(
-        n, reference_time=(WINDOW_START + timedelta(hours=120)).timestamp()
+    assert old_conf[old_ids.index("u1")] == pytest.approx(
+        recent_conf[recent_ids.index("u1")], abs=1e-6
     )
-    assert implicit == pytest.approx(explicit)
+
+
+# ------------------------------------------------------------------ bug 2
 
 
 def test_recency_discriminates_within_the_window():
-    """The regression test for bug 2, recency half.
-
-    With a hard-coded 30-day normaliser, a user last seen on day 0 and one last seen
-    on day 5 scored exp(-5/30)=0.85 vs 1.0 -- a 0.15 spread on a 0.3-weighted term.
-    Normalising by the window makes the difference real.
-    """
-    learner = _learner_over_window(
-        {
-            "early": [0, 1],  # stops at the very start
-            "late": [118, 120],  # active at the window end
-        }
-    )
-    n = learner.next_user_idx
-    conf = learner._compute_confidence_scores(n, window_days=5.0)
-    early = conf[learner.user_id_to_idx["early"]]
-    late = conf[learner.user_id_to_idx["late"]]
-    # Same volume, so the whole gap comes from recency.
-    assert late - early > 0.2
+    """With a hard-coded 30-day normaliser a user last seen on day 0 and one last seen
+    on day 5 scored exp(-5/30)=0.85 vs 1.0 -- a 0.15 spread on a 0.3-weighted term."""
+    actions = [
+        repost("early", "p1", "a1", 0), repost("early", "p2", "a2", 1),
+        repost("late", "p3", "a3", 7198), repost("late", "p4", "a4", 7199),
+    ]
+    fx = build(actions)
+    assert conf_of(fx, "late") - conf_of(fx, "early") > 0.2
 
 
 def test_lifespan_uses_the_full_zero_to_one_range():
-    """The regression test for bug 2, lifespan half.
-
-    Against a 30-day normaliser, a user spanning the entire 5-day window scored
-    5/30 = 0.167 -- indistinguishable from a user spanning one day (0.033).
-    """
-    learner = _learner_over_window(
-        {
-            "burst": [0, 0.1, 0.2, 0.3],  # all activity in 18 minutes
-            "spread": [0, 40, 80, 120],  # spread across the window
-        }
-    )
-    n = learner.next_user_idx
-    conf = learner._compute_confidence_scores(n, window_days=5.0)
-    # Identical volume; 'spread' must win on lifespan.
-    assert conf[learner.user_id_to_idx["spread"]] > conf[learner.user_id_to_idx["burst"]]
+    """Against a 30-day normaliser a user spanning the whole 5-day window scored
+    5/30 = 0.167, indistinguishable from one spanning a day (0.033)."""
+    actions = [repost("burst", f"b{i}", f"a{i}", i * 0.1) for i in range(4)]
+    actions += [repost("spread", f"s{i}", f"a{i}", i * 2400) for i in range(4)]
+    fx = build(actions)
+    assert conf_of(fx, "spread") > conf_of(fx, "burst")
 
 
-def test_confidence_stays_in_unit_interval():
-    learner = _learner_over_window({f"u{i}": list(range(0, 121, 12)) for i in range(5)})
-    conf = learner._compute_confidence_scores(learner.next_user_idx)
-    assert np.all(conf >= 0.0) and np.all(conf <= 1.0)
+# ------------------------------------------------------------------ shape
 
 
 def test_volume_still_dominates_as_documented():
-    """Volume carries 50%: a prolific user must outrank a one-action user."""
-    learner = _learner_over_window({"heavy": list(range(0, 121, 6)), "light": [120]})
-    n = learner.next_user_idx
-    conf = learner._compute_confidence_scores(n, window_days=5.0)
-    assert conf[learner.user_id_to_idx["heavy"]] > conf[learner.user_id_to_idx["light"]]
+    actions = [repost("heavy", f"p{i}", f"a{i}", i * 60) for i in range(40)]
+    actions += [repost("light", "px", "ax", 7000)]
+    fx = build(actions)
+    assert conf_of(fx, "heavy") > conf_of(fx, "light")
 
 
-def test_zero_users_returns_empty():
-    assert ArchetypeLearner()._compute_confidence_scores(0).shape == (0,)
+def test_confidence_stays_in_the_unit_interval():
+    actions = [repost(f"u{i%5}", f"p{i}", f"a{i%3}", i * 30) for i in range(200)]
+    _, c = build(actions).confidence()
+    assert np.all(c >= 0.0) and np.all(c <= 1.0)
+
+
+def test_empty_window_returns_empty():
+    ids, c = build([]).confidence()
+    assert ids == [] and c.shape == (0,)
 
 
 def test_single_instant_window_does_not_divide_by_zero():
-    learner = _learner_over_window({"u1": [0], "u2": [0]})
-    conf = learner._compute_confidence_scores(learner.next_user_idx)
-    assert np.all(np.isfinite(conf))
+    actions = [repost("u1", "p1", "a", 0), repost("u2", "p1", "a", 0)]
+    fx = build(actions, start=START, end=START)
+    _, c = fx.confidence()
+    assert np.all(np.isfinite(c))
+
+
+def test_confidence_scores_is_pure_and_vectorised():
+    conf = confidence_scores(
+        involvement=np.array([0.0, 1.0, 20.0, 1000.0]),
+        first_seen=np.full(4, START.timestamp()),
+        last_seen=np.full(4, END.timestamp()),
+        window_start=START,
+        window_end=END,
+    )
+    assert conf.shape == (4,)
+    assert np.all(np.diff(conf) >= 0)  # monotone in volume
+    assert np.all((conf >= 0) & (conf <= 1))

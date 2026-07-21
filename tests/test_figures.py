@@ -332,6 +332,28 @@ def _fitted(n_events=2, n_windows=4, bar=0.4):
     return windows, Zs, bar
 
 
+def test_the_claim_figure_is_written_and_survives_a_partial_run(tmp_path):
+    pytest.importorskip("matplotlib")
+    windows, Zs, _ = _fitted(n_events=2, n_windows=4)
+    mf.plot_claim(windows, Zs, tmp_path / "claim.pdf")
+    assert (tmp_path / "claim.pdf").stat().st_size > 1000
+    # one event only, and the empty-run guard
+    w1, z1, _ = _fitted(n_events=1, n_windows=3)
+    mf.plot_claim(w1, z1, tmp_path / "one.pdf")
+    assert (tmp_path / "one.pdf").stat().st_size > 1000
+    mf.plot_claim([], [], tmp_path / "none.pdf")
+    assert not (tmp_path / "none.pdf").exists()
+
+
+def test_the_claim_figure_reads_the_median_and_the_raw_feature():
+    """The figure's safety is that panel (b) has no embedding in it. If it stopped
+    reading co_action_size it would silently become a second copy of panel (a)."""
+    import inspect
+    src = inspect.getsource(mf.plot_claim)
+    assert "co_action_size" in src
+    assert "median" in src
+
+
 def test_the_head_figures_are_written(tmp_path):
     pytest.importorskip("matplotlib")
     windows, Zs, bar = _fitted()

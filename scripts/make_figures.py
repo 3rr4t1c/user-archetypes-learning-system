@@ -3,19 +3,21 @@
 
 What it produces
 ----------------
-    fig_mean_score_per_window.pdf   the published figure: mean archetype score per window
-    fig_prevalence.pdf              accounts above a fixed bar: count, and rate per 100k
-    fig_threshold_sweep.pdf         the same at four bars, to show the bar is not the finding
-    fig_head_intensity.pdf          p99/p99.9 per window -- no denominator
-    fig_concentration.pdf           Gini and top-1% mass share -- no threshold either
-    fig_prepost_prevalence.pdf      pre / post / late per event, absolute and fold change
-    fig_archetype_space.pdf         pairwise scatter of the three axes (talks)
-    fig_cohorts.pdf                 --cohorts only: incumbents vs newcomers
+    fig_coordination_e1.pdf         THE figure: the forced/disengagement split (paper)
     archetype_fit.json              the frozen embedding -- the ruler
     loadings.txt                    what each axis is actually made of
-    windows.csv                     the numbers behind the mean figure, N included
+    windows.csv                     per-window means and medians of the three axes, N
     features.csv                    per-window means of the twelve raw features
     prevalence.csv                  every head statistic, per window per axis
+    diagnostics/                    everything a reviewer might want, out of the way:
+      fig_mean_score_per_window.pdf   the published figure: mean archetype score
+      fig_prevalence.pdf              accounts above a common bar: count and rate/100k
+      fig_threshold_sweep.pdf         the same at five bars: the bar is not the finding
+      fig_head_intensity.pdf          p99/p99.9 per window -- no denominator
+      fig_concentration.pdf           Gini and top-1% mass share -- no threshold
+      fig_prepost_prevalence.pdf      pre / post / late per event, absolute and fold change
+      fig_archetype_space.pdf         pairwise scatter of the three axes (talks)
+      fig_cohorts.pdf                 --cohorts only: incumbents vs newcomers
 
 Why the mean figure is not enough
 ---------------------------------
@@ -315,6 +317,86 @@ def _panels(windows):
     """
     return [ev for ev in EVENTS
             if any(w["event"] == ev["id"] and len(w["ids"]) for w in windows)]
+
+
+#: Colours for the claim figure: E1 is the finding, the other three are the flat
+#: controls, so E1 is red and foregrounded and the rest recede.
+CLAIM_COLOUR = {"E1": "#d62728", "E2": "#0173B2", "E3": "#029E73", "E4": "#8c564b"}
+CLAIM_MARKER = {"E1": "o", "E2": "s", "E3": "^", "E4": "D"}
+CLAIM_NAME = {
+    "E1": "E1 Brazil ban (forced)",
+    "E2": "E2 X ToS (disengagement)",
+    "E3": "E3 US election (disengagement)",
+    "E4": "E4 Meta ToS (disengagement)",
+}
+
+
+def plot_claim(windows, Zs, path):
+    """The one figure the paper's micro-scale claim rests on.
+
+    Every event is aligned by window index relative to its own onset: window 1 is the
+    pre-event window (the event falls at its end), window 2 the first post-event window,
+    and so on. All events are then overlaid, so the eye compares the forced migration
+    (E1) directly against the three disengagement migrations (E2, E3, E4).
+
+    Two panels saying the same thing at two levels:
+
+    (a) the median COORDINATED score -- the typical user, not the head. It jumps from 0
+        to ~0.16 at E1 and holds for a month; it never leaves 0 at E2, E3 or E4.
+    (b) the raw feature underneath it, co_action_size (mean distinct co-actors on the
+        same post within delta_t). Panel (a) could in principle be an artdefact of the
+        pooled embedding; panel (b) has no embedding in it at all and shows the same
+        same thing, which is what makes the claim safe.
+
+    The control the figure must survive is population: E1's window 2 tripled the user
+    base, so a reader will suspect the jump is just more people colliding on popular
+    posts. It is not -- E3 and E4 carry MORE users than E1 (up to 1.53M vs 1.05M) and
+    stay flat, and reposts-per-user is level across every event. That control lives in
+    the caption and the guide, not the figure, but it is why panel (b) is here.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+
+    coord = AXES.index("coordinated")
+    size_col = FEATURE_NAMES.index("co_action_size")
+
+    def by_event(ev_id):
+        rows = [(w, Z) for w, Z in zip(windows, Zs)
+                if w["event"] == ev_id and len(w["ids"])]
+        rows.sort(key=lambda r: r[0]["w"])
+        xs = [r[0]["w"] - 1 for r in rows]  # -1 = pre-event window, 0 = event onset...
+        med = [float(np.median(Z[:, coord])) for _, Z in rows]
+        size = [float(w["X"][:, size_col].mean()) for w, _ in rows]
+        return xs, med, size
+
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(9.4, 3.6))
+        for ev in events:
+            xs, med, size = by_event(ev["id"])
+            lead = ev["id"] == "E1"
+            kw = dict(color=CLAIM_COLOUR[ev["id"]], marker=CLAIM_MARKER[ev["id"]],
+                      linewidth=2.2 if lead else 1.3, markersize=6.5 if lead else 4.5,
+                      markeredgewidth=0, zorder=5 if lead else 3)
+            axes[0].plot(xs, med, label=CLAIM_NAME[ev["id"]], **kw)
+            axes[1].plot(xs, size, **kw)
+
+        for ax in axes:
+            # The event happens between the pre-event window and window 2.
+            ax.axvline(-0.5, color="#888888", linestyle=":", linewidth=1.2, zorder=1)
+            ax.set_xticks(range(-1, 6))
+            ax.set_xticklabels(["pre", "0", "+5", "+10", "+15", "+20", "+25"])
+            ax.set_xlabel("days relative to event")
+            ax.set_axisbelow(True)
+        axes[0].set_ylabel("Median coordinated score\n(the typical user)")
+        axes[1].set_ylabel("Mean co-actors per reshare\n(co_action_size, raw counts)")
+        axes[0].set_title("(a) Coordinated archetype axis", fontsize=10)
+        axes[1].set_title("(b) The raw feature beneath it", fontsize=10)
+        axes[0].legend(loc="upper right", frameon=False, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def plot_evolution(windows, Zs, path):
@@ -844,20 +926,27 @@ def main():
     write_features_csv(windows, out / "features.csv")
     write_prevalence_csv(windows, Zs, bar, out / "prevalence.csv")
 
-    # The published figure: mean over every account. Kept, and named for what it is --
-    # the mean is dominated by the ~99% of accounts that are no archetype at all, which
-    # is why median_superspreader is 0.0000 in every window and why the four figures
-    # below exist.
-    plot_evolution(windows, Zs, out / "fig_mean_score_per_window.pdf")
+    # THE paper figure: the forced/disengagement split, typical user and raw feature.
+    plot_claim(windows, Zs, out / "fig_coordination_e1.pdf")
 
-    plot_prevalence(windows, Zs, bar, out / "fig_prevalence.pdf")
-    plot_threshold_sweep(windows, Zs, out / "fig_threshold_sweep.pdf")
-    plot_head_intensity(windows, Zs, out / "fig_head_intensity.pdf")
-    plot_concentration(windows, Zs, out / "fig_concentration.pdf")
-    plot_prepost(windows, Zs, bar, out / "fig_prepost_prevalence.pdf")
-    plot_archetype_space(windows, Zs, out / "fig_archetype_space.pdf")
+    # Everything else is a diagnostic -- it exists so a reviewer can check the claim,
+    # not to sit in the paper. Kept out of the main directory so the one figure that
+    # carries the argument is not lost among eight that support it.
+    diag = out / "diagnostics"
+    diag.mkdir(exist_ok=True)
+
+    # The published figure: mean over every account. Named for what it is -- the mean is
+    # dominated by the ~99% of accounts that are no archetype at all, which is why
+    # median_superspreader is 0.0000 in every window and why the head figures exist.
+    plot_evolution(windows, Zs, diag / "fig_mean_score_per_window.pdf")
+    plot_prevalence(windows, Zs, bar, diag / "fig_prevalence.pdf")
+    plot_threshold_sweep(windows, Zs, diag / "fig_threshold_sweep.pdf")
+    plot_head_intensity(windows, Zs, diag / "fig_head_intensity.pdf")
+    plot_concentration(windows, Zs, diag / "fig_concentration.pdf")
+    plot_prepost(windows, Zs, bar, diag / "fig_prepost_prevalence.pdf")
+    plot_archetype_space(windows, Zs, diag / "fig_archetype_space.pdf")
     if args.cohorts:
-        plot_cohorts(windows, Zs, out / "fig_cohorts.pdf")
+        plot_cohorts(windows, Zs, diag / "fig_cohorts.pdf")
 
     print("\n" + "=" * 72)
     print(embedder.loadings_table())

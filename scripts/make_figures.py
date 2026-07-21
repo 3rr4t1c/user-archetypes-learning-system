@@ -3,7 +3,10 @@
 
 What it produces
 ----------------
-    fig_coordination_e1.pdf         THE figure: the forced/disengagement split (paper)
+    fig_coordination_population.pdf THE figure (population): median coordinated score --
+                                    only E1 moves the typical user
+    fig_archetype_prevalence.pdf    THE figure (head): prevalence per archetype, each on
+                                    its own scale -- shows every axis's event structure
     archetype_fit.json              the frozen embedding -- the ruler
     loadings.txt                    what each axis is actually made of
     windows.csv                     per-window means and medians of the three axes, N
@@ -319,82 +322,117 @@ def _panels(windows):
             if any(w["event"] == ev["id"] and len(w["ids"]) for w in windows)]
 
 
-#: Colours for the claim figure: E1 is the finding, the other three are the flat
-#: controls, so E1 is red and foregrounded and the rest recede.
-CLAIM_COLOUR = {"E1": "#d62728", "E2": "#0173B2", "E3": "#029E73", "E4": "#8c564b"}
+#: Overlay palette for the event-comparison figures.
+#:
+#: Seaborn's colorblind palette (the paper's), so the four events are distinguishable
+#: to colourblind readers; E1 (the forced migration) is drawn heavier because it is the
+#: one that behaves differently, but every event is a full member of the plot.
+CLAIM_COLOUR = {"E1": "#0173B2", "E2": "#DE8F05", "E3": "#029E73", "E4": "#D55E00"}
 CLAIM_MARKER = {"E1": "o", "E2": "s", "E3": "^", "E4": "D"}
 CLAIM_NAME = {
-    "E1": "E1 Brazil ban (forced)",
-    "E2": "E2 X ToS (disengagement)",
-    "E3": "E3 US election (disengagement)",
-    "E4": "E4 Meta ToS (disengagement)",
+    "E1": "E1  Brazil ban (forced)",
+    "E2": "E2  X ToS",
+    "E3": "E3  US election",
+    "E4": "E4  Meta ToS",
 }
 
 
-def plot_claim(windows, Zs, path):
-    """The one figure the paper's micro-scale claim rests on.
+def _overlay(ax, series_by_event, ylog=False):
+    """Draw one panel: one line per event, E1 emphasised, colourblind palette."""
+    for ev_id, (xs, ys) in series_by_event.items():
+        lead = ev_id == "E1"
+        ax.plot(xs, ys, color=CLAIM_COLOUR[ev_id], marker=CLAIM_MARKER[ev_id],
+                label=CLAIM_NAME[ev_id], linewidth=2.4 if lead else 1.3,
+                markersize=6.5 if lead else 4.5, markeredgewidth=0,
+                zorder=5 if lead else 3)
+    if ylog:
+        ax.set_yscale("log")
+    ax.axvline(-2.5, color="#666666", linestyle=":", linewidth=1.1, zorder=1)
+    ax.set_xticks([-5, 0, 10, 20])
+    ax.set_xlabel("days since event")
+    ax.set_axisbelow(True)
 
-    Every event is aligned by window index relative to its own onset: window 1 is the
-    pre-event window (the event falls at its end), window 2 the first post-event window,
-    and so on. All events are then overlaid, so the eye compares the forced migration
-    (E1) directly against the three disengagement migrations (E2, E3, E4).
 
-    Two panels saying the same thing at two levels:
+def _rows_for(windows, Zs, ev_id):
+    rows = [(w, Z) for w, Z in zip(windows, Zs)
+            if w["event"] == ev_id and len(w["ids"])]
+    rows.sort(key=lambda r: r[0]["w"])
+    xs = [r[0]["w"] * 5 - 5 for r in rows]  # window 1 -> -5 days (pre), window 2 -> 0
+    return xs, rows
 
-    (a) the median COORDINATED score -- the typical user, not the head. It jumps from 0
-        to ~0.16 at E1 and holds for a month; it never leaves 0 at E2, E3 or E4.
-    (b) the raw feature underneath it, co_action_size (mean distinct co-actors on the
-        same post within delta_t). Panel (a) could in principle be an artdefact of the
-        pooled embedding; panel (b) has no embedding in it at all and shows the same
-        same thing, which is what makes the claim safe.
 
-    The control the figure must survive is population: E1's window 2 tripled the user
-    base, so a reader will suspect the jump is just more people colliding on popular
-    posts. It is not -- E3 and E4 carry MORE users than E1 (up to 1.53M vs 1.05M) and
-    stay flat, and reposts-per-user is level across every event. That control lives in
-    the caption and the guide, not the figure, but it is why panel (b) is here.
+def plot_population_median(windows, Zs, path):
+    """The population-level signature: the coordinated score of the MEDIAN user.
+
+    This is the striking, threshold-free half of the finding. A median cannot be moved by
+    a rare minority, so a change in it means the *typical* account changed. Only the
+    forced migration (E1) moves it -- the median user goes from co-acting with no one to
+    co-acting, and stays there for a month. At the three disengagement events it never
+    leaves zero: whatever coordination they provoke is confined to a small head group
+    (see plot_prevalence_by_archetype) and never becomes a population phenomenon.
+
+    A super-spreader or amplifier median would be zero everywhere by construction (those
+    classes are far too rare to reach a population median), which is exactly why this
+    panel is coordinated-only and the head view is a separate figure.
+    """
+    plt = _mpl()
+    events = _panels(windows)
+    if not events:
+        return
+    coord = AXES.index("coordinated")
+
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(5.8, 3.6))
+        series = {}
+        for ev in events:
+            xs, rows = _rows_for(windows, Zs, ev["id"])
+            series[ev["id"]] = (xs, [float(np.median(Z[:, coord])) for _, Z in rows])
+        _overlay(ax, series)
+        ax.set_ylabel("median coordinated score")
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False,
+                   bbox_to_anchor=(0.5, 1.10), columnspacing=1.6)
+        fig.tight_layout(rect=[0, 0, 1, 0.98])
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_prevalence_by_archetype(windows, Zs, bar, path):
+    """The head-level view, one panel per archetype, each on its OWN scale.
+
+    The archetypes occur at scales orders of magnitude apart -- super-spreaders are a
+    handful, amplifiers are many, coordinated accounts sit between -- so they cannot share
+    a y-axis and a population mean cannot see the rare ones at all. Each panel therefore
+    plots prevalence (accounts per 100k scoring above `bar` on that axis) over time, on
+    its own log scale, all four events overlaid.
+
+    This is the figure that shows the scale asymmetry was accounted for, and it corrects a
+    tempting error: at the head, super-spreaders are NOT flat -- their prevalence rises
+    ~2.7x after E1 and climbs at E4 -- even though the population mean and median (which a
+    rare class cannot move) look dead. Coordinated prevalence jumps 6-17x at the shocks;
+    amplification is the one axis that barely responds to any event.
     """
     plt = _mpl()
     events = _panels(windows)
     if not events:
         return
 
-    coord = AXES.index("coordinated")
-    size_col = FEATURE_NAMES.index("co_action_size")
-
-    def by_event(ev_id):
-        rows = [(w, Z) for w, Z in zip(windows, Zs)
-                if w["event"] == ev_id and len(w["ids"])]
-        rows.sort(key=lambda r: r[0]["w"])
-        xs = [r[0]["w"] - 1 for r in rows]  # -1 = pre-event window, 0 = event onset...
-        med = [float(np.median(Z[:, coord])) for _, Z in rows]
-        size = [float(w["X"][:, size_col].mean()) for w, _ in rows]
-        return xs, med, size
-
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(1, 2, figsize=(9.4, 3.6))
-        for ev in events:
-            xs, med, size = by_event(ev["id"])
-            lead = ev["id"] == "E1"
-            kw = dict(color=CLAIM_COLOUR[ev["id"]], marker=CLAIM_MARKER[ev["id"]],
-                      linewidth=2.2 if lead else 1.3, markersize=6.5 if lead else 4.5,
-                      markeredgewidth=0, zorder=5 if lead else 3)
-            axes[0].plot(xs, med, label=CLAIM_NAME[ev["id"]], **kw)
-            axes[1].plot(xs, size, **kw)
-
-        for ax in axes:
-            # The event happens between the pre-event window and window 2.
-            ax.axvline(-0.5, color="#888888", linestyle=":", linewidth=1.2, zorder=1)
-            ax.set_xticks(range(-1, 6))
-            ax.set_xticklabels(["pre", "0", "+5", "+10", "+15", "+20", "+25"])
-            ax.set_xlabel("days relative to event")
-            ax.set_axisbelow(True)
-        axes[0].set_ylabel("Median coordinated score\n(the typical user)")
-        axes[1].set_ylabel("Mean co-actors per reshare\n(co_action_size, raw counts)")
-        axes[0].set_title("(a) Coordinated archetype axis", fontsize=10)
-        axes[1].set_title("(b) The raw feature beneath it", fontsize=10)
-        axes[0].legend(loc="upper right", frameon=False, fontsize=8)
-        fig.tight_layout()
+        fig, axes = plt.subplots(1, len(AXES), figsize=(3.4 * len(AXES), 3.5))
+        for ax, axis in zip(axes, AXES):
+            a = AXES.index(axis)
+            series = {}
+            for ev in events:
+                xs, rows = _rows_for(windows, Zs, ev["id"])
+                ys = [head_stats(Z[:, a], bar, axis).rate_per_100k for _, Z in rows]
+                series[ev["id"]] = (xs, [y if y > 0 else np.nan for y in ys])
+            _overlay(ax, series, ylog=True)
+            ax.set_title(AXIS_LABEL[axis], fontsize=11)
+        axes[0].set_ylabel("accounts per 100k")
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=len(events), frameon=False,
+                   bbox_to_anchor=(0.5, 1.06), columnspacing=1.6, handletextpad=0.4)
+        fig.tight_layout(rect=[0, 0, 1, 0.99])
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
 
@@ -926,8 +964,11 @@ def main():
     write_features_csv(windows, out / "features.csv")
     write_prevalence_csv(windows, Zs, bar, out / "prevalence.csv")
 
-    # THE paper figure: the forced/disengagement split, typical user and raw feature.
-    plot_claim(windows, Zs, out / "fig_coordination_e1.pdf")
+    # THE two paper figures, at the two scales the finding lives at:
+    #   population level -- only E1 moves the typical user's coordination;
+    #   head level       -- every archetype has event structure, on its own scale.
+    plot_population_median(windows, Zs, out / "fig_coordination_population.pdf")
+    plot_prevalence_by_archetype(windows, Zs, bar, out / "fig_archetype_prevalence.pdf")
 
     # Everything else is a diagnostic -- it exists so a reviewer can check the claim,
     # not to sit in the paper. Kept out of the main directory so the one figure that

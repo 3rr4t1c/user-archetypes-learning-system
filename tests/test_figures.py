@@ -332,26 +332,40 @@ def _fitted(n_events=2, n_windows=4, bar=0.4):
     return windows, Zs, bar
 
 
-def test_the_claim_figure_is_written_and_survives_a_partial_run(tmp_path):
+def test_the_two_claim_figures_are_written_and_survive_a_partial_run(tmp_path):
     pytest.importorskip("matplotlib")
-    windows, Zs, _ = _fitted(n_events=2, n_windows=4)
-    mf.plot_claim(windows, Zs, tmp_path / "claim.pdf")
-    assert (tmp_path / "claim.pdf").stat().st_size > 1000
+    windows, Zs, bar = _fitted(n_events=2, n_windows=4)
+    mf.plot_population_median(windows, Zs, tmp_path / "pop.pdf")
+    mf.plot_prevalence_by_archetype(windows, Zs, bar, tmp_path / "prev.pdf")
+    assert (tmp_path / "pop.pdf").stat().st_size > 1000
+    assert (tmp_path / "prev.pdf").stat().st_size > 1000
     # one event only, and the empty-run guard
-    w1, z1, _ = _fitted(n_events=1, n_windows=3)
-    mf.plot_claim(w1, z1, tmp_path / "one.pdf")
+    w1, z1, b1 = _fitted(n_events=1, n_windows=3)
+    mf.plot_population_median(w1, z1, tmp_path / "one.pdf")
+    mf.plot_prevalence_by_archetype(w1, z1, b1, tmp_path / "one2.pdf")
     assert (tmp_path / "one.pdf").stat().st_size > 1000
-    mf.plot_claim([], [], tmp_path / "none.pdf")
+    mf.plot_population_median([], [], tmp_path / "none.pdf")
+    mf.plot_prevalence_by_archetype([], [], 0.5, tmp_path / "none2.pdf")
     assert not (tmp_path / "none.pdf").exists()
+    assert not (tmp_path / "none2.pdf").exists()
 
 
-def test_the_claim_figure_reads_the_median_and_the_raw_feature():
-    """The figure's safety is that panel (b) has no embedding in it. If it stopped
-    reading co_action_size it would silently become a second copy of panel (a)."""
+def test_the_population_figure_uses_the_median_a_rare_class_cannot_move():
+    """The population panel is coordinated-only and reads the median deliberately: a
+    median cannot be moved by a rare minority, so a move means the typical user changed.
+    A super-spreader median would be zero everywhere by construction."""
     import inspect
-    src = inspect.getsource(mf.plot_claim)
-    assert "co_action_size" in src
-    assert "median" in src
+    src = inspect.getsource(mf.plot_population_median)
+    assert "median" in src and "coordinated" in src
+
+
+def test_the_head_figure_gives_each_archetype_its_own_axis():
+    """The scale asymmetry the whole discussion turned on: amplifiers outnumber
+    super-spreaders by orders of magnitude, so they cannot share a y-axis."""
+    import inspect
+    src = inspect.getsource(mf.plot_prevalence_by_archetype)
+    assert "subplots(1, len(AXES)" in src
+    assert "rate_per_100k" in src
 
 
 def test_the_head_figures_are_written(tmp_path):

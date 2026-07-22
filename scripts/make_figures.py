@@ -373,7 +373,9 @@ def _overlay(ax, series_by_event, ylog=False):
                 markeredgewidth=0, zorder=3)
     if ylog:
         ax.set_yscale("log")
-    ax.axvline(-2.5, color="#666666", linestyle=":", linewidth=1.1, zorder=1)
+    # The event is at x=0: window 1 (pre-event, at -5) covers the five days before it,
+    # window 2 (at 0) is the first window that starts at the event. The line marks it.
+    ax.axvline(0, color="#666666", linestyle=":", linewidth=1.1, zorder=1)
     ax.set_xticks([-5, 0, 10, 20])
     ax.set_xlabel("days since event")
     ax.set_axisbelow(True)

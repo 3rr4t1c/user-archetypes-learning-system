@@ -329,8 +329,12 @@ def _panels(windows):
 #: one that behaves differently, but every event is a full member of the plot.
 CLAIM_COLOUR = {"E1": "#0173B2", "E2": "#DE8F05", "E3": "#029E73", "E4": "#D55E00"}
 CLAIM_MARKER = {"E1": "o", "E2": "s", "E3": "^", "E4": "D"}
+#: Legend labels: event id + short name, no "(forced)/(disengagement)" tag. Tagging only
+#: E1 was inconsistent (why not the others?), and tagging all four made the legend a wall
+#: of text. E1 is still visually distinct (heavier line) and the caption states it is the
+#: forced migration, which is where that belongs.
 CLAIM_NAME = {
-    "E1": "E1  Brazil ban (forced)",
+    "E1": "E1  Brazil ban",
     "E2": "E2  X ToS",
     "E3": "E3  US election",
     "E4": "E4  Meta ToS",
@@ -914,6 +918,15 @@ def main():
                     help="do not log1p the features before scaling. Only for comparison: "
                          "on raw counts one account defines the axis and the other 99.9%% "
                          "are pinned at zero.")
+    ap.add_argument("--min-confidence", type=float, default=0.0,
+                    help="drop users whose confidence (data-availability score, "
+                         "arles.features.confidence) is below this before fitting and "
+                         "plotting. Default 0.0 keeps everyone. The prior work used such "
+                         "a filter; here it is off by default because a forced-migration "
+                         "influx is a mass of newly-arrived, low-confidence accounts, and "
+                         "filtering them removes the very population whose behaviour is "
+                         "the finding. Raise it to test robustness among well-observed "
+                         "users; the kept fraction is reported per window.")
     args = ap.parse_args()
 
     if args.events:
@@ -942,6 +955,22 @@ def main():
     if not any(len(w["ids"]) for w in windows):
         print("\nNo users in any window. Nothing to plot.")
         return
+
+    if args.min_confidence > 0.0:
+        # Keep only well-observed users. This is what the prior work did; here it is
+        # opt-in, and reported, because at a forced-migration influx the low-confidence
+        # users ARE the phenomenon. See --min-confidence.
+        print(f"\nfiltering users at confidence >= {args.min_confidence:g}")
+        for w in windows:
+            if not len(w["ids"]):
+                continue
+            keep = np.asarray(w["conf"]) >= args.min_confidence
+            kept, tot = int(keep.sum()), len(w["ids"])
+            print(f"  {w['event']} w{w['w'] + 1}: {kept:,}/{tot:,} "
+                  f"({100.0 * kept / tot:.1f}%) kept")
+            w["ids"] = [u for u, k in zip(w["ids"], keep) if k]
+            w["X"] = w["X"][keep]
+            w["conf"] = np.asarray(w["conf"])[keep]
 
     # ONE fit, all 14 windows, then frozen. See the module docstring.
     print("\nfitting the embedding on all windows pooled ...")

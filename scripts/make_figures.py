@@ -144,6 +144,25 @@ EVENTS = [
 N_WINDOWS = 7
 WINDOW_DAYS = 5.0
 
+#: Minimum confidence for a user's vector to enter the analysis.
+#:
+#: Confidence (arles.features.confidence) is data availability: 0.5*volume + 0.3*recency
+#: + 0.2*lifespan, where volume saturates around 20 actions. An archetype vector built on
+#: one or two observed actions is not evidence, so it should not be scored as though it
+#: were -- describing a confidence score and then ignoring it would be indefensible.
+#:
+#: 0.3 is the point below which a user has effectively been seen act only once or twice.
+#: Worked cases in a 5-day window: a single action scores ~0.13-0.42 (depending only on
+#: how recent it was); ~3 actions spread across a couple of days score ~0.37; ~5 score
+#: ~0.6. So 0.3 keeps users with a few actions and drops the barely-seen. It is a
+#: deliberately low, interpretable bar, not a percentile -- the kept fraction falls out
+#: of the data (about a third of a pre-event window, fewer at an influx).
+#:
+#: This does not erase a forced-migration influx, it delays it: newly-arrived accounts
+#: cross the bar once they have acted a few times, so the effect surfaces a little later
+#: rather than vanishing. Set --min-confidence 0.0 to keep everyone.
+DEFAULT_MIN_CONFIDENCE = 0.3
+
 #: Where the archive stops. Any window ending after this is incomplete by definition and
 #: is not plotted -- see EVENTS["n_windows"] for E4.
 ARCHIVE_END = "2025-01-28"
@@ -342,13 +361,16 @@ CLAIM_NAME = {
 
 
 def _overlay(ax, series_by_event, ylog=False):
-    """Draw one panel: one line per event, E1 emphasised, colourblind palette."""
+    """Draw one panel: one line per event, all weighted equally, colourblind palette.
+
+    No event is emphasised. Drawing E1 heavier pre-loaded the conclusion into the styling
+    -- the four events are distinguished by colour and marker, and the reader is left to
+    see which one behaves differently.
+    """
     for ev_id, (xs, ys) in series_by_event.items():
-        lead = ev_id == "E1"
         ax.plot(xs, ys, color=CLAIM_COLOUR[ev_id], marker=CLAIM_MARKER[ev_id],
-                label=CLAIM_NAME[ev_id], linewidth=2.4 if lead else 1.3,
-                markersize=6.5 if lead else 4.5, markeredgewidth=0,
-                zorder=5 if lead else 3)
+                label=CLAIM_NAME[ev_id], linewidth=1.6, markersize=5.0,
+                markeredgewidth=0, zorder=3)
     if ylog:
         ax.set_yscale("log")
     ax.axvline(-2.5, color="#666666", linestyle=":", linewidth=1.1, zorder=1)
@@ -918,15 +940,15 @@ def main():
                     help="do not log1p the features before scaling. Only for comparison: "
                          "on raw counts one account defines the axis and the other 99.9%% "
                          "are pinned at zero.")
-    ap.add_argument("--min-confidence", type=float, default=0.0,
+    ap.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
                     help="drop users whose confidence (data-availability score, "
                          "arles.features.confidence) is below this before fitting and "
-                         "plotting. Default 0.0 keeps everyone. The prior work used such "
-                         "a filter; here it is off by default because a forced-migration "
-                         "influx is a mass of newly-arrived, low-confidence accounts, and "
-                         "filtering them removes the very population whose behaviour is "
-                         "the finding. Raise it to test robustness among well-observed "
-                         "users; the kept fraction is reported per window.")
+                         "plotting (default %(default)s). Confidence combines volume, "
+                         "recency and lifespan; below ~0.3 a user has essentially been "
+                         "seen act only once or twice, too little to characterise. A "
+                         "vector must not be trusted where there is no evidence for it, "
+                         "so the gate is on by default; set 0.0 to keep everyone. The "
+                         "kept fraction is reported per window.")
     args = ap.parse_args()
 
     if args.events:
@@ -993,17 +1015,20 @@ def main():
     write_features_csv(windows, out / "features.csv")
     write_prevalence_csv(windows, Zs, bar, out / "prevalence.csv")
 
-    # THE two paper figures, at the two scales the finding lives at:
-    #   population level -- only E1 moves the typical user's coordination;
-    #   head level       -- every archetype has event structure, on its own scale.
-    plot_population_median(windows, Zs, out / "fig_coordination_population.pdf")
-    plot_prevalence_by_archetype(windows, Zs, bar, out / "fig_archetype_prevalence.pdf")
-
-    # Everything else is a diagnostic -- it exists so a reviewer can check the claim,
-    # not to sit in the paper. Kept out of the main directory so the one figure that
-    # carries the argument is not lost among eight that support it.
+    # Diagnostics live out of the main directory so the one paper figure is not lost
+    # among the many that support it.
     diag = out / "diagnostics"
     diag.mkdir(exist_ok=True)
+
+    # THE paper figure: prevalence per archetype, each on its own scale, all four events.
+    plot_prevalence_by_archetype(windows, Zs, bar, out / "fig_archetype_prevalence.pdf")
+
+    # The population-median figure is retired from the main output (kept as a diagnostic).
+    # It made one point -- only E1 moves the median user -- but three of its four lines
+    # are pinned at exactly zero, which reads as a broken plot rather than a result, and
+    # the same point is one sentence of text plus the coordinated panel above. See the
+    # guide's note on why it was dropped.
+    plot_population_median(windows, Zs, diag / "fig_population_median.pdf")
 
     # The published figure: mean over every account. Named for what it is -- the mean is
     # dominated by the ~99% of accounts that are no archetype at all, which is why

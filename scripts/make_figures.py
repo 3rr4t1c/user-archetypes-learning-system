@@ -456,7 +456,7 @@ def plot_prevalence_by_archetype(windows, Zs, bar, path):
                 series[ev["id"]] = (xs, [y if y > 0 else np.nan for y in ys])
             _overlay(ax, series, ylog=True)
             ax.set_title(AXIS_LABEL[axis], fontsize=11)
-        axes[0].set_ylabel("accounts per 100k")
+        axes[0].set_ylabel("accounts per 100k users")
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper center", ncol=len(events), frameon=False,
                    bbox_to_anchor=(0.5, 1.06), columnspacing=1.6, handletextpad=0.4)

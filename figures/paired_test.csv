@@ -1,0 +1,13 @@
+event,axis,n_pairs,median_pre,median_post,median_diff,wilcoxon_stat,p_value,method
+E1,superspreader,36852,0.063,0.0549,-0.0081,283253175.5,5.7800871207283134e-158,scipy exact/asymptotic
+E1,amplifier,36852,0.1236,0.1258,0.0,160166199.5,1.8290459734177913e-54,scipy exact/asymptotic
+E1,coordinated,36852,0.0,0.0,0.0,88398644.5,2.3305712938337432e-52,scipy exact/asymptotic
+E2,superspreader,66936,0.06,0.0673,0.0018,1034774480.5,2.801959174146587e-61,scipy exact/asymptotic
+E2,amplifier,66936,0.1164,0.1548,0.0,506516909.5,0.0,scipy exact/asymptotic
+E2,coordinated,66936,0.0,0.0,0.0,336100360.0,2.8913918229403745e-53,scipy exact/asymptotic
+E3,superspreader,147215,0.0642,0.0566,-0.0065,4622652511.0,0.0,scipy exact/asymptotic
+E3,amplifier,147215,0.1297,0.1344,0.0,2722487547.5,1.1146989251736296e-105,scipy exact/asymptotic
+E3,coordinated,147215,0.0,0.0,0.0,1225174727.5,0.0,scipy exact/asymptotic
+E4,superspreader,172820,0.056,0.0559,0.0003,7300174027.0,4.551624162478379e-12,scipy exact/asymptotic
+E4,amplifier,172820,0.1123,0.1197,0.0,3240362241.0,2.4215152437699324e-289,scipy exact/asymptotic
+E4,coordinated,172820,0.0,0.0,0.0,1700735984.5,7.409040576482657e-147,scipy exact/asymptotic

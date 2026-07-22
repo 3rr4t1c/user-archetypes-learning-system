@@ -1,0 +1,18 @@
+superspreader:
+    influence_score          +0.493
+    h_index                  +0.510
+    tai_score                +0.533
+    tash_index               +0.461
+    (raw PC1 range on the pooled fit: -1.598 .. 25.508)
+amplifier:
+    repost_count             +0.530
+    repost_rate              +0.513
+    ear_index                +0.418
+    amplification_breadth    +0.531
+    (raw PC1 range on the pooled fit: -1.673 .. 10.583)
+coordinated:
+    co_action_rate           +0.592
+    co_action_size           +0.574
+    co_action_latency        +0.350
+    niche_co_action          +0.444
+    (raw PC1 range on the pooled fit: -0.983 .. 13.915)

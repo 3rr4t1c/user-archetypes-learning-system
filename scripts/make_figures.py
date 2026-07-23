@@ -348,16 +348,10 @@ def _panels(windows):
 #: one that behaves differently, but every event is a full member of the plot.
 CLAIM_COLOUR = {"E1": "#0173B2", "E2": "#DE8F05", "E3": "#029E73", "E4": "#D55E00"}
 CLAIM_MARKER = {"E1": "o", "E2": "s", "E3": "^", "E4": "D"}
-#: Legend labels: event id + short name, no "(forced)/(disengagement)" tag. Tagging only
-#: E1 was inconsistent (why not the others?), and tagging all four made the legend a wall
-#: of text. E1 is still visually distinct (heavier line) and the caption states it is the
-#: forced migration, which is where that belongs.
-CLAIM_NAME = {
-    "E1": "E1  Brazil ban",
-    "E2": "E2  X ToS",
-    "E3": "E3  US election",
-    "E4": "E4  Meta ToS",
-}
+#: Legend labels are just the event ids. The events are defined in the paper body
+#: (Sec. 4.1), so repeating "Brazil ban" etc. in the legend only adds width; the ids
+#: sit above the panels as a compact key.
+CLAIM_NAME = {"E1": "E1", "E2": "E2", "E3": "E3", "E4": "E4"}
 
 
 def _overlay(ax, series_by_event, ylog=False):
@@ -369,7 +363,7 @@ def _overlay(ax, series_by_event, ylog=False):
     """
     for ev_id, (xs, ys) in series_by_event.items():
         ax.plot(xs, ys, color=CLAIM_COLOUR[ev_id], marker=CLAIM_MARKER[ev_id],
-                label=CLAIM_NAME[ev_id], linewidth=1.6, markersize=5.0,
+                label=CLAIM_NAME[ev_id], linewidth=1.8, markersize=5.5,
                 markeredgewidth=0, zorder=3)
     if ylog:
         ax.set_yscale("log")
@@ -446,9 +440,12 @@ def plot_prevalence_by_archetype(windows, Zs, bar, path):
         return
 
     with plt.rc_context(STYLE):
-        # Sized for a two-column-spanning figure* at ~7.3in wide, so fonts render at full
-        # size rather than being shrunk when scaled to \textwidth.
-        fig, axes = plt.subplots(1, len(AXES), figsize=(2.45 * len(AXES), 2.9))
+        # A two-column-spanning figure* (\includegraphics[width=\textwidth]). At 10.2in
+        # wide the three panels are proper landscape rectangles; height 3.0in (down from
+        # the original 3.5) squeezes the vertical extent for the page budget without
+        # forcing the panels toward square. LaTeX scales the whole thing to \textwidth, so
+        # only the aspect ratio matters on the page.
+        fig, axes = plt.subplots(1, len(AXES), figsize=(3.4 * len(AXES), 3.0))
         for ax, axis in zip(axes, AXES):
             a = AXES.index(axis)
             series = {}
@@ -461,8 +458,8 @@ def plot_prevalence_by_archetype(windows, Zs, bar, path):
         axes[0].set_ylabel("accounts per 100k users")
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper center", ncol=len(events), frameon=False,
-                   bbox_to_anchor=(0.5, 1.06), columnspacing=1.6, handletextpad=0.4)
-        fig.tight_layout(rect=[0, 0, 1, 0.99])
+                   bbox_to_anchor=(0.5, 1.03), columnspacing=2.2, handletextpad=0.4)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
 

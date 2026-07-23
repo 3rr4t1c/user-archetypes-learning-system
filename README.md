@@ -67,7 +67,7 @@ python -m arles.mappers.bluesky /path/to/raw_export canonical.csv --start 2024-1
 ```bash
 conda env create -f environment.yml
 conda activate arles
-pytest            # ~170 tests, a couple of seconds
+pytest            # ~250 tests, a couple of seconds
 ```
 
 Runtime needs **numpy** only. `scipy` (paired statistics), `tqdm` (progress bars) and
@@ -171,10 +171,24 @@ coordination signal in O(users) instead.
 
 | | |
 |---|---|
+| `scripts/make_figures.py` | Score every window on one frozen fit and produce the archetype-prevalence figure plus the tables behind it (`windows.csv`, `prevalence.csv`, `features.csv`). Diagnostics go to `figures/diagnostics/`. |
+| `scripts/prevalence_test.py` | Two-proportion test of pre- vs post-event prevalence, per axis per event. Reads `prevalence.csv`; no archive pass. |
+| `scripts/paired_test.py` | Incumbent paired Wilcoxon on per-user scores, for testing whether the same accounts changed. |
 | `scripts/check_reshare_density.py` | Can your data support the super-spreader axis? Reports reshares per author and the h-index distribution, per window. |
 | `scripts/tune_time_aware.py` | Re-fit (α, δ) for the TASH-Index and TAI-Score on *your* data, by the nDCG grid search of the original paper. |
 | `scripts/analyse_tuning.py` | Re-read a saved tuning surface in seconds, without touching the archive. |
 | `python -m arles.mappers.bluesky` | Raw Bluesky export → canonical CSV. |
+
+### Reproducing the paper's figure and statistics
+
+```bash
+python scripts/make_figures.py /path/to/archive --out figures/
+python scripts/prevalence_test.py figures/prevalence.csv --out figures/prevalence_test.csv
+```
+
+The first scores every window on one pooled fit, applies the confidence gate (0.3 by
+default), and writes `fig_archetype_prevalence.pdf` with the tables behind it; the second
+runs the significance test. Both are deterministic and the second needs no archive pass.
 
 ---
 
@@ -222,9 +236,10 @@ arles/
   streaming.py   windowed, bounded-memory reading of a large archive
   features.py    the twelve features, two passes
   embedding.py   12 -> 3, with a frozen pooled fit
+  prevalence.py  head statistics for a rare class: prevalence, tails, concentration
   tuning.py      re-fitting (alpha, delta) by nDCG grid search
-scripts/         diagnostics and fitting, all runnable standalone
-tests/           ~170 tests; most pin a bug that actually shipped
+scripts/         figures, statistics, diagnostics and fitting, all runnable standalone
+tests/           ~250 tests; most pin a bug that actually shipped
 ```
 
 ---

@@ -446,7 +446,9 @@ def plot_prevalence_by_archetype(windows, Zs, bar, path):
         return
 
     with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(1, len(AXES), figsize=(3.4 * len(AXES), 3.5))
+        # Sized for a two-column-spanning figure* at ~7.3in wide, so fonts render at full
+        # size rather than being shrunk when scaled to \textwidth.
+        fig, axes = plt.subplots(1, len(AXES), figsize=(2.45 * len(AXES), 2.9))
         for ax, axis in zip(axes, AXES):
             a = AXES.index(axis)
             series = {}
